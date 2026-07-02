@@ -276,6 +276,142 @@ def detect_5min_signal(bars_5m: List[Dict[str, float]], direction: str, atr_5m: 
 
     return {"signal": "none", "type": None, "detail": "无 H1/H2/L1/L2 信号"}
 
+def scan_signal_history(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str, float]], atr_5m: float, max_signals: int = 50) -> List[Dict[str, Any]]:
+    """扫描 5min K线历史，检测所有 H1/H2/L1/L2 信号点，并计算事后盈亏。
+    每个信号记录: time, signal_type, direction(long/short), entry_price, stop_price, target_price,
+    之后追踪到止损或止盈，记录结果(win/loss/ongoing)和盈亏点数。
+    """
+    signals = []
+    if len(bars_5m) < 5:
+        return signals
+    
+    # 用 1h 方向作为全局方向参考
+    struct_1h = detect_hh_hl(bars_1h)
+    global_dir = struct_1h.get("direction", "range")
+    
+    for i in range(2, len(bars_5m) - 1):
+        c1 = bars_5m[i - 1]
+        c2 = bars_5m[i]
+        detected = None
+        
+        # 尝试做多信号 (up 或 range 方向)
+        if global_dir in ("up", "range"):
+            # H2
+            if c2["high"] > c1["high"] and c2["low"] >= c1["low"] and c2["close"] > c1["close"]:
+                detected = {"signal": "H2", "type": "long", "entry": c2["close"]}
+            # H1
+            else:
+                body = c2["close"] - c2["open"]
+                rng = c2["high"] - c2["low"]
+                if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] > c1["high"]:
+                    detected = {"signal": "H1", "type": "long", "entry": c2["close"]}
+        
+        # 尝试做空信号 (down 或 range 方向)
+        if not detected and global_dir in ("down", "range"):
+            # L2
+            if c2["low"] < c1["low"] and c2["high"] <= c1["high"] and c2["close"] < c1["close"]:
+                detected = {"signal": "L2", "type": "short", "entry": c2["close"]}
+            # L1
+            else:
+                body = c2["open"] - c2["close"]
+                rng = c2["high"] - c2["low"]
+                if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] < c1["low"]:
+                    detected = {"signal": "L1", "type": "short", "entry": c2["close"]}
+        
+        if not detected:
+            continue
+        
+        # 计算止损止盈
+        stop_dist = atr_5m * 1.6
+        if detected["type"] == "long":
+            stop = detected["entry"] - stop_dist
+            target = detected["entry"] + stop_dist * 1.5  # 震荡日 1.5R
+        else:
+            stop = detected["entry"] + stop_dist
+            target = detected["entry"] - stop_dist * 1.5
+        
+        # 追踪后续 bars 判断结果
+        result_status = "ongoing"
+        exit_price = None
+        exit_time = None
+        pnl_points = 0.0
+        bars_after = 0
+        
+        for j in range(i + 1, len(bars_5m)):
+            bars_after += 1
+            bar = bars_5m[j]
+            # 最多追踪 60 根 5min K线 (5小时)
+            if bars_after > 60:
+                break
+            
+            if detected["type"] == "long":
+                # 止损优先
+                if bar["low"] <= stop:
+                    result_status = "loss"
+                    exit_price = stop
+                    exit_time = bar["dt"].strftime("%H:%M")
+                    pnl_points = stop - detected["entry"]
+                    break
+                if bar["high"] >= target:
+                    result_status = "win"
+                    exit_price = target
+                    exit_time = bar["dt"].strftime("%H:%M")
+                    pnl_points = target - detected["entry"]
+                    break
+            else:
+                if bar["high"] >= stop:
+                    result_status = "loss"
+                    exit_price = stop
+                    exit_time = bar["dt"].strftime("%H:%M")
+                    pnl_points = detected["entry"] - stop
+                    break
+                if bar["low"] <= target:
+                    result_status = "win"
+                    exit_price = target
+                    exit_time = bar["dt"].strftime("%H:%M")
+                    pnl_points = detected["entry"] - target
+                    break
+        
+        # 如果还没结束，用最后一根 bar 的 close 作为当前浮动盈亏
+        if result_status == "ongoing" and bars_after > 0:
+            last_bar = bars_5m[-1]
+            if detected["type"] == "long":
+                pnl_points = last_bar["close"] - detected["entry"]
+            else:
+                pnl_points = detected["entry"] - last_bar["close"]
+            exit_price = last_bar["close"]
+            exit_time = "--"
+        
+        signals.append({
+            "time": c2["dt"].strftime("%m-%d %H:%M"),
+            "ts": c2["ts"],
+            "signal": detected["signal"],
+            "type": detected["type"],
+            "entry": detected["entry"],
+            "stop": stop,
+            "target": target,
+            "result": result_status,
+            "exit": exit_price,
+            "exit_time": exit_time,
+            "pnl": pnl_points,
+            "bars_after": bars_after,
+        })
+    
+    # 去重: 同方向同类型 5 根 K线内只保留第一个
+    deduped = []
+    last_sig_key = None
+    last_sig_idx = -10
+    for i, s in enumerate(signals):
+        key = f"{s['type']}_{s['signal']}"
+        if key == last_sig_key and (i - last_sig_idx) < 5:
+            continue
+        deduped.append(s)
+        last_sig_key = key
+        last_sig_idx = i
+    
+    return deduped[-max_signals:]
+
+
 def key_levels(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str, float]]) -> Dict[str, Any]:
     """找关键支撑/阻力位"""
     # 取最近 1h 的 swing high/low 作为阻力/支撑
@@ -603,7 +739,7 @@ def check_rules(cfg: Dict, bars_1h: List, bars_5m: List) -> Dict[str, Any]:
 
 # ---------------- HTML Report (Bloomberg Terminal Style) ----------------
 
-def generate_html(result: Dict[str, Any], bars_1h, bars_5m) -> str:
+def generate_html(result: Dict[str, Any], bars_1h, bars_5m, signal_history=None) -> str:
     checks = result["checks"]
     last_price = bars_5m[-1]["close"] if bars_5m else 0
     prev_price = bars_5m[-2]["close"] if len(bars_5m) >= 2 else last_price
@@ -784,6 +920,57 @@ def generate_html(result: Dict[str, Any], bars_1h, bars_5m) -> str:
     r4_result_color = up_color if is_trend_day else warn_color
     r4_result_text = "趋势日 TREND DAY" if is_trend_day else "震荡日 RANGE DAY"
 
+    # === 准备 TradingView Lightweight Charts 数据 ===
+    # 5min K线数据 (最多取最近 200 根)
+    chart_bars = []
+    for b in bars_5m[-200:]:
+        chart_bars.append({
+            "time": b["ts"],
+            "open": round(b["open"], 2),
+            "high": round(b["high"], 2),
+            "low": round(b["low"], 2),
+            "close": round(b["close"], 2),
+        })
+    
+    # 信号 markers
+    chart_markers = []
+    if signal_history:
+        for s in signal_history:
+            is_long = s["type"] == "long"
+            color = up_color if is_long else down_color
+            arrow = "arrowUp" if is_long else "arrowDown"
+            position = "belowBar" if is_long else "aboveBar"
+            result_icon = "✓" if s["result"] == "win" else ("✗" if s["result"] == "loss" else "…")
+            label = f"{s['signal']} {result_icon}"
+            chart_markers.append({
+                "time": s["ts"],
+                "position": position,
+                "color": color,
+                "shape": arrow,
+                "text": label,
+                "entry": s["entry"],
+                "stop": s["stop"],
+                "target": s["target"],
+                "result": s["result"],
+                "pnl": round(s["pnl"], 2),
+            })
+    
+    # 信号历史表
+    sig_history_json = json.dumps(signal_history or [], ensure_ascii=False)
+    chart_bars_json = json.dumps(chart_bars)
+    chart_markers_json = json.dumps(chart_markers)
+    
+    # 统计胜率
+    if signal_history:
+        completed = [s for s in signal_history if s["result"] in ("win", "loss")]
+        wins = sum(1 for s in completed if s["result"] == "win")
+        losses = len(completed) - wins
+        winrate = (wins / len(completed) * 100) if completed else 0
+        total_pnl = sum(s["pnl"] for s in completed)
+        stats_text = f"{wins}W / {losses}L | 胜率 {winrate:.0f}% | 总盈亏 {total_pnl:+.1f}点 | {len(signal_history)} 信号"
+    else:
+        stats_text = "暂无历史信号"
+
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -869,6 +1056,28 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
 /* === Footer === */
 .footer {{ padding:8px 14px; color:var(--dim2); font-size:10px; border-top:1px solid var(--border); display:flex; gap:16px; }}
 .footer .tag {{ color:var(--dim); }}
+
+/* === Chart Section === */
+.chart-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
+.chart-header {{ padding:8px 14px; background:#161616; border-bottom:1px solid var(--border2); display:flex; align-items:center; gap:8px; }}
+.chart-header .title {{ color:var(--orange); font-size:11px; font-weight:700; letter-spacing:1px; }}
+.chart-header .stats {{ margin-left:auto; font-size:10px; color:var(--dim); }}
+.chart-legend {{ padding:6px 14px; background:#0d0d0d; border-top:1px solid var(--border2); font-size:10px; }}
+
+/* === Signal History Table === */
+.signal-history-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
+.signal-table-wrap {{ max-height:300px; overflow-y:auto; }}
+.signal-table {{ width:100%; border-collapse:collapse; font-size:11px; }}
+.signal-table th {{ position:sticky; top:0; background:#161616; color:var(--dim); font-size:9px; text-transform:uppercase; letter-spacing:0.5px; padding:6px 8px; text-align:left; border-bottom:1px solid var(--border2); }}
+.signal-table td {{ padding:5px 8px; border-bottom:1px solid var(--border); color:#ccc; }}
+.signal-table tr:hover td {{ background:rgba(255,136,0,0.04); }}
+.signal-table .win {{ color:var(--green); font-weight:700; }}
+.signal-table .loss {{ color:var(--red); font-weight:700; }}
+.signal-table .ongoing {{ color:var(--yellow); }}
+.signal-table .long-tag {{ color:var(--green); }}
+.signal-table .short-tag {{ color:var(--red); }}
+.signal-table .pnl-pos {{ color:var(--green); }}
+.signal-table .pnl-neg {{ color:var(--red); }}
 
 /* === Settings Gear === */
 .gear-btn {{ background:none; border:1px solid var(--border2); color:var(--dim); padding:4px 8px; border-radius:4px; cursor:pointer; font-size:14px; font-family:var(--mono); transition:all 0.2s; }}
@@ -972,6 +1181,47 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
 <!-- Rule Groups -->
 <div class="rule-groups">
     {groups_html}
+</div>
+
+<!-- TradingView Chart + Signal History -->
+<div class="chart-section">
+    <div class="chart-header">
+        <span class="title">📈 5MIN K线 + 信号标记</span>
+        <span class="stats">{stats_text}</span>
+    </div>
+    <div id="tradingChart" style="width:100%;height:400px;background:#0a0a0a;"></div>
+    <div class="chart-legend">
+        <span style="color:{up_color}">▲ 绿色箭头 = 做多信号 (H1/H2)</span>
+        <span style="color:{down_color};margin-left:20px">▼ 红色箭头 = 做空信号 (L1/L2)</span>
+        <span style="color:var(--dim);margin-left:20px">✓=止盈 ✗=止损 …=未结束</span>
+    </div>
+</div>
+
+<div class="signal-history-section">
+    <div class="chart-header">
+        <span class="title">📋 信号历史记录</span>
+        <span class="stats">事后验证盈亏</span>
+    </div>
+    <div class="signal-table-wrap">
+        <table class="signal-table" id="signalTable">
+            <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>信号</th>
+                    <th>方向</th>
+                    <th>入场价</th>
+                    <th>止损</th>
+                    <th>目标</th>
+                    <th>结果</th>
+                    <th>出场价</th>
+                    <th>出场时间</th>
+                    <th>盈亏(点)</th>
+                    <th>K线数</th>
+                </tr>
+            </thead>
+            <tbody id="signalTableBody"></tbody>
+        </table>
+    </div>
 </div>
 
 <!-- Footer -->
@@ -1084,6 +1334,142 @@ async function saveTelegram() {
         }
     } catch(e) { showStatus('❌ ' + e.message, false); }
 }
+
+// === Lightweight Charts ===
+const CHART_BARS = ''' + chart_bars_json + ''';
+const CHART_MARKERS = ''' + chart_markers_json + ''';
+const SIG_HISTORY = ''' + sig_history_json + ''';
+
+function loadChart() {
+    const container = document.getElementById('tradingChart');
+    if (!container || typeof LightweightCharts === 'undefined') return;
+    
+    const chart = LightweightCharts.createChart(container, {
+        layout: {
+            background: { type: 'solid', color: '#0a0a0a' },
+            textColor: '#666',
+            fontSize: 10,
+        },
+        grid: {
+            vertLines: { color: '#1a1a1a' },
+            horzLines: { color: '#1a1a1a' },
+        },
+        crosshair: {
+            mode: LightweightCharts.CrosshairMode.Normal,
+            vertLine: { color: '#ff8800', labelBackgroundColor: '#ff8800' },
+            horzLine: { color: '#ff8800', labelBackgroundColor: '#ff8800' },
+        },
+        rightPriceScale: {
+            borderColor: '#2a2a2a',
+            scaleMargins: { top: 0.1, bottom: 0.1 },
+        },
+        timeScale: {
+            borderColor: '#2a2a2a',
+            timeVisible: true,
+            secondsVisible: false,
+        },
+        width: container.clientWidth,
+        height: 400,
+    });
+    
+    const candleSeries = chart.addCandlestickSeries({
+        upColor: '#00e676',
+        downColor: '#ff5252',
+        borderUpColor: '#00e676',
+        borderDownColor: '#ff5252',
+        wickUpColor: '#00e676',
+        wickDownColor: '#ff5252',
+    });
+    
+    candleSeries.setData(CHART_BARS);
+    
+    // 添加信号 markers
+    if (CHART_MARKERS.length > 0) {
+        candleSeries.setMarkers(CHART_MARKERS.map(m => ({
+            time: m.time,
+            position: m.position,
+            color: m.color,
+            shape: m.shape,
+            text: m.text,
+        })));
+        
+        // 添加入场价水平线
+        CHART_MARKERS.forEach(m => {
+            if (m.entry) {
+                candleSeries.createPriceLine({
+                    price: m.entry,
+                    color: m.color,
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dotted,
+                    axisLabelVisible: true,
+                    title: m.text,
+                });
+            }
+        });
+    }
+    
+    chart.timeScale().fitContent();
+    
+    // 响应式
+    new ResizeObserver(entries => {
+        if (entries[0]) {
+            chart.applyOptions({ width: entries[0].contentRect.width });
+        }
+    }).observe(container);
+}
+
+function renderSignalTable() {
+    const tbody = document.getElementById('signalTableBody');
+    if (!tbody) return;
+    
+    if (!SIG_HISTORY || SIG_HISTORY.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--dim);padding:20px">暂无历史信号记录</td></tr>';
+        return;
+    }
+    
+    tbody.innerHTML = SIG_HISTORY.slice().reverse().map(s => {
+        const resultClass = s.result === 'win' ? 'win' : s.result === 'loss' ? 'loss' : 'ongoing';
+        const resultText = s.result === 'win' ? '✅ 止盈' : s.result === 'loss' ? '❌ 止损' : '⏳ 进行中';
+        const dirClass = s.type === 'long' ? 'long-tag' : 'short-tag';
+        const dirText = s.type === 'long' ? '做多' : '做空';
+        const pnlClass = s.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        return `<tr>
+            <td>${s.time}</td>
+            <td><strong>${s.signal}</strong></td>
+            <td class="${dirClass}">${dirText}</td>
+            <td>${s.entry.toFixed(2)}</td>
+            <td>${s.stop.toFixed(2)}</td>
+            <td>${s.target.toFixed(2)}</td>
+            <td class="${resultClass}">${resultText}</td>
+            <td>${s.exit ? s.exit.toFixed(2) : '--'}</td>
+            <td>${s.exit_time || '--'}</td>
+            <td class="${pnlClass}">${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(1)}</td>
+            <td>${s.bars_after}</td>
+        </tr>`;
+    }).join('');
+}
+
+// 加载 Lightweight Charts SDK
+function loadScript(src) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+    });
+}
+
+loadScript('https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js')
+    .then(() => {
+        loadChart();
+        renderSignalTable();
+    })
+    .catch(e => {
+        console.error('Failed to load Lightweight Charts:', e);
+        const container = document.getElementById('tradingChart');
+        if (container) container.innerHTML = '<div style="padding:20px;color:var(--dim);text-align:center">图表加载失败，请检查网络</div>';
+    });
 </script>'''
     html = html.replace('__SCRIPT_PLACEHOLDER__', js_code)
     return html
@@ -1156,7 +1542,12 @@ def run_engine() -> dict:
     bars_5m = to_bars(r5m)
 
     result = check_rules(cfg, bars_1h, bars_5m)
-    html = generate_html(result, bars_1h, bars_5m)
+    
+    # 扫描历史信号
+    atr_5m = result.get("atr_5m", 10.0)
+    sig_history = scan_signal_history(bars_5m, bars_1h, atr_5m)
+    
+    html = generate_html(result, bars_1h, bars_5m, signal_history=sig_history)
 
     # 推送逻辑
     should_push = False
@@ -1206,7 +1597,9 @@ def main():
     log(f"规则引擎: all_pass={result['all_pass']}, direction={result['direction']}, mode={result['day_mode']}, signal={result['signal']['signal']}")
 
     # 生成 HTML
-    html = generate_html(result, bars_1h, bars_5m)
+    atr_5m_local = result.get("atr_5m", 10.0)
+    sig_history_local = scan_signal_history(bars_5m, bars_1h, atr_5m_local)
+    html = generate_html(result, bars_1h, bars_5m, signal_history=sig_history_local)
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
     log(f"HTML 报告已写入: {REPORT_PATH}")
