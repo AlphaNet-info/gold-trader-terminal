@@ -921,10 +921,21 @@ def generate_html(result: Dict[str, Any], bars_1h, bars_5m, signal_history=None)
     r4_result_text = "趋势日 TREND DAY" if is_trend_day else "震荡日 RANGE DAY"
 
     # === 准备 TradingView Lightweight Charts 数据 ===
-    # 5min K线数据 (最多取最近 200 根)
-    chart_bars = []
-    for b in bars_5m[-200:]:
-        chart_bars.append({
+    # 5min K线数据 (全部)
+    chart_bars_5m = []
+    for b in bars_5m:
+        chart_bars_5m.append({
+            "time": b["ts"],
+            "open": round(b["open"], 2),
+            "high": round(b["high"], 2),
+            "low": round(b["low"], 2),
+            "close": round(b["close"], 2),
+        })
+    
+    # 1H K线数据 (全部)
+    chart_bars_1h = []
+    for b in bars_1h:
+        chart_bars_1h.append({
             "time": b["ts"],
             "open": round(b["open"], 2),
             "high": round(b["high"], 2),
@@ -949,15 +960,14 @@ def generate_html(result: Dict[str, Any], bars_1h, bars_5m, signal_history=None)
                 "shape": arrow,
                 "text": label,
                 "entry": s["entry"],
-                "stop": s["stop"],
-                "target": s["target"],
                 "result": s["result"],
                 "pnl": round(s["pnl"], 2),
             })
     
     # 信号历史表
     sig_history_json = json.dumps(signal_history or [], ensure_ascii=False)
-    chart_bars_json = json.dumps(chart_bars)
+    chart_bars_5m_json = json.dumps(chart_bars_5m)
+    chart_bars_1h_json = json.dumps(chart_bars_1h)
     chart_markers_json = json.dumps(chart_markers)
     
     # 统计胜率
@@ -1063,6 +1073,12 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
 .chart-header .title {{ color:var(--orange); font-size:11px; font-weight:700; letter-spacing:1px; }}
 .chart-header .stats {{ margin-left:auto; font-size:10px; color:var(--dim); }}
 .chart-legend {{ padding:6px 14px; background:#0d0d0d; border-top:1px solid var(--border2); font-size:10px; }}
+
+/* === Timeframe Buttons === */
+.tf-buttons {{ display:flex; gap:4px; margin-left:12px; }}
+.tf-btn {{ background:#1a1a1a; border:1px solid var(--border2); color:var(--dim); font-size:10px; font-weight:700; padding:3px 10px; border-radius:3px; cursor:pointer; letter-spacing:0.5px; transition:all 0.15s; }}
+.tf-btn:hover {{ border-color:var(--orange); color:var(--orange); }}
+.tf-btn.active {{ background:var(--orange); color:#000; border-color:var(--orange); }}
 
 /* === Signal History Table === */
 .signal-history-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
@@ -1186,14 +1202,19 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
 <!-- TradingView Chart + Signal History -->
 <div class="chart-section">
     <div class="chart-header">
-        <span class="title">📈 5MIN K线 + 信号标记</span>
-        <span class="stats">{stats_text}</span>
+        <span class="title">📈 K线图 + 信号标记</span>
+        <div class="tf-buttons">
+            <button class="tf-btn active" data-tf="5m" onclick="switchTf('5m')">5min</button>
+            <button class="tf-btn" data-tf="1h" onclick="switchTf('1h')">1H</button>
+        </div>
+        <span class="stats" id="chartStats">{stats_text}</span>
     </div>
-    <div id="tradingChart" style="width:100%;height:400px;background:#0a0a0a;"></div>
+    <div id="tradingChart" style="width:100%;height:500px;background:#0a0a0a;"></div>
     <div class="chart-legend">
-        <span style="color:{up_color}">▲ 绿色箭头 = 做多信号 (H1/H2)</span>
-        <span style="color:{down_color};margin-left:20px">▼ 红色箭头 = 做空信号 (L1/L2)</span>
-        <span style="color:var(--dim);margin-left:20px">✓=止盈 ✗=止损 …=未结束</span>
+        <span style="color:{up_color}">▲ 做多 (H1/H2)</span>
+        <span style="color:{down_color};margin-left:16px">▼ 做空 (L1/L2)</span>
+        <span style="color:var(--dim);margin-left:16px">✓止盈 ✗止损 …进行中</span>
+        <span style="color:var(--dim);margin-left:16px">鼠标拖拽平移 · 滚轮缩放</span>
     </div>
 </div>
 
@@ -1336,86 +1357,114 @@ async function saveTelegram() {
 }
 
 // === Lightweight Charts ===
-const CHART_BARS = ''' + chart_bars_json + ''';
+const CHART_BARS_5M = ''' + chart_bars_5m_json + ''';
+const CHART_BARS_1H = ''' + chart_bars_1h_json + ''';
 const CHART_MARKERS = ''' + chart_markers_json + ''';
 const SIG_HISTORY = ''' + sig_history_json + ''';
+
+let g_chart = null;
+let g_series = null;
+let g_currentTf = '5m';
 
 function loadChart() {
     const container = document.getElementById('tradingChart');
     if (!container || typeof LightweightCharts === 'undefined') return;
     
-    const chart = LightweightCharts.createChart(container, {
+    g_chart = LightweightCharts.createChart(container, {
         layout: {
             background: { type: 'solid', color: '#0a0a0a' },
-            textColor: '#666',
-            fontSize: 10,
+            textColor: '#888',
+            fontSize: 11,
         },
         grid: {
-            vertLines: { color: '#1a1a1a' },
-            horzLines: { color: '#1a1a1a' },
+            vertLines: { color: '#141414' },
+            horzLines: { color: '#141414' },
         },
         crosshair: {
             mode: LightweightCharts.CrosshairMode.Normal,
-            vertLine: { color: '#ff8800', labelBackgroundColor: '#ff8800' },
-            horzLine: { color: '#ff8800', labelBackgroundColor: '#ff8800' },
+            vertLine: { color: '#ff8800', labelBackgroundColor: '#ff8800', width: 1, style: LightweightCharts.LineStyle.Dashed },
+            horzLine: { color: '#ff8800', labelBackgroundColor: '#ff8800', width: 1, style: LightweightCharts.LineStyle.Dashed },
         },
         rightPriceScale: {
             borderColor: '#2a2a2a',
-            scaleMargins: { top: 0.1, bottom: 0.1 },
+            scaleMargins: { top: 0.08, bottom: 0.08 },
         },
         timeScale: {
             borderColor: '#2a2a2a',
             timeVisible: true,
             secondsVisible: false,
+            rightOffset: 5,
+            barSpacing: 6,
         },
         width: container.clientWidth,
-        height: 400,
+        height: 500,
     });
     
-    const candleSeries = chart.addCandlestickSeries({
+    applyTfData('5m');
+    
+    // 响应式
+    new ResizeObserver(entries => {
+        if (entries[0] && g_chart) {
+            g_chart.applyOptions({ width: entries[0].contentRect.width });
+        }
+    }).observe(container);
+}
+
+function applyTfData(tf) {
+    if (!g_chart) return;
+    g_currentTf = tf;
+    
+    // 移除旧 series
+    if (g_series) {
+        g_chart.removeSeries(g_series);
+        g_series = null;
+    }
+    
+    const data = tf === '5m' ? CHART_BARS_5M : CHART_BARS_1H;
+    
+    g_series = g_chart.addCandlestickSeries({
         upColor: '#00e676',
         downColor: '#ff5252',
         borderUpColor: '#00e676',
         borderDownColor: '#ff5252',
         wickUpColor: '#00e676',
         wickDownColor: '#ff5252',
+        priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
     });
     
-    candleSeries.setData(CHART_BARS);
+    g_series.setData(data);
     
-    // 添加信号 markers
-    if (CHART_MARKERS.length > 0) {
-        candleSeries.setMarkers(CHART_MARKERS.map(m => ({
+    // 信号 markers — 只在 5min 图上显示
+    if (tf === '5m' && CHART_MARKERS.length > 0) {
+        g_series.setMarkers(CHART_MARKERS.map(m => ({
             time: m.time,
             position: m.position,
             color: m.color,
             shape: m.shape,
             text: m.text,
         })));
-        
-        // 添加入场价水平线
-        CHART_MARKERS.forEach(m => {
-            if (m.entry) {
-                candleSeries.createPriceLine({
-                    price: m.entry,
-                    color: m.color,
-                    lineWidth: 1,
-                    lineStyle: LightweightCharts.LineStyle.Dotted,
-                    axisLabelVisible: true,
-                    title: m.text,
-                });
-            }
-        });
     }
     
-    chart.timeScale().fitContent();
+    g_chart.timeScale().fitContent();
     
-    // 响应式
-    new ResizeObserver(entries => {
-        if (entries[0]) {
-            chart.applyOptions({ width: entries[0].contentRect.width });
-        }
-    }).observe(container);
+    // 更新统计
+    updateChartStats(tf);
+}
+
+function switchTf(tf) {
+    document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+    document.querySelector('.tf-btn[data-tf="' + tf + '"]').classList.add('active');
+    applyTfData(tf);
+}
+
+function updateChartStats(tf) {
+    const el = document.getElementById('chartStats');
+    if (!el) return;
+    const data = tf === '5m' ? CHART_BARS_5M : CHART_BARS_1H;
+    const count = data.length;
+    const lastBar = data[data.length - 1];
+    const firstBar = data[0];
+    el.textContent = `${tf.toUpperCase()} · ${count} 根K线 · ${firstBar ? new Date(firstBar.time * 1000).toLocaleDateString() : ''} → ${lastBar ? new Date(lastBar.time * 1000).toLocaleDateString() : ''}`;
 }
 
 function renderSignalTable() {

@@ -24,6 +24,6 @@
   "scan_interval_seconds": 300,
   "data_interval_1h": "1h",
   "data_interval_5m": "5m",
-  "data_range_1h": "5d",
-  "data_range_5m": "5d"
+  "data_range_1h": "1mo",
+  "data_range_5m": "1mo"
 }
