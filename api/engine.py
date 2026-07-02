@@ -298,25 +298,29 @@ def scan_signal_history(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str,
         if global_dir in ("up", "range"):
             # H2
             if c2["high"] > c1["high"] and c2["low"] >= c1["low"] and c2["close"] > c1["close"]:
-                detected = {"signal": "H2", "type": "long", "entry": c2["close"]}
+                detected = {"signal": "H2", "type": "long", "entry": c2["close"],
+                           "reason": f"连续两根抬高: H2({c2['high']:.1f})>H1({c1['high']:.1f}), L2({c2['low']:.1f})≥L1({c1['low']:.1f}), Close({c2['close']:.1f})>前Close({c1['close']:.1f})"}
             # H1
             else:
                 body = c2["close"] - c2["open"]
                 rng = c2["high"] - c2["low"]
                 if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] > c1["high"]:
-                    detected = {"signal": "H1", "type": "long", "entry": c2["close"]}
+                    detected = {"signal": "H1", "type": "long", "entry": c2["close"],
+                               "reason": f"强阳线吞没: 实体占比{body/rng*100:.0f}%, Close({c2['close']:.1f})>前High({c1['high']:.1f})"}
         
         # 尝试做空信号 (down 或 range 方向)
         if not detected and global_dir in ("down", "range"):
             # L2
             if c2["low"] < c1["low"] and c2["high"] <= c1["high"] and c2["close"] < c1["close"]:
-                detected = {"signal": "L2", "type": "short", "entry": c2["close"]}
+                detected = {"signal": "L2", "type": "short", "entry": c2["close"],
+                           "reason": f"连续两根降低: L2({c2['low']:.1f})<L1({c1['low']:.1f}), H2({c2['high']:.1f})≤H1({c1['high']:.1f}), Close({c2['close']:.1f})<前Close({c1['close']:.1f})"}
             # L1
             else:
                 body = c2["open"] - c2["close"]
                 rng = c2["high"] - c2["low"]
                 if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] < c1["low"]:
-                    detected = {"signal": "L1", "type": "short", "entry": c2["close"]}
+                    detected = {"signal": "L1", "type": "short", "entry": c2["close"],
+                               "reason": f"强阴线吞没: 实体占比{body/rng*100:.0f}%, Close({c2['close']:.1f})<前Low({c1['low']:.1f})"}
         
         if not detected:
             continue
@@ -387,6 +391,8 @@ def scan_signal_history(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str,
             "ts": c2["ts"],
             "signal": detected["signal"],
             "type": detected["type"],
+            "reason": detected.get("reason", ""),
+            "global_dir": global_dir,
             "entry": detected["entry"],
             "stop": stop,
             "target": target,
@@ -1095,6 +1101,25 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
 .signal-table .pnl-pos {{ color:var(--green); }}
 .signal-table .pnl-neg {{ color:var(--red); }}
 
+/* === Signal Analysis === */
+.signal-analysis-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
+.analysis-body {{ padding:14px; font-size:11px; line-height:1.8; color:#aaa; }}
+.analysis-body h4 {{ color:var(--orange); font-size:11px; margin:0 0 6px 0; letter-spacing:1px; }}
+.analysis-body .metric-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin-bottom:12px; }}
+.analysis-body .metric {{ background:#0d0d0d; border:1px solid var(--border2); border-radius:4px; padding:8px 10px; }}
+.analysis-body .metric .label {{ font-size:9px; color:var(--dim2); text-transform:uppercase; letter-spacing:0.5px; }}
+.analysis-body .metric .value {{ font-size:16px; font-weight:700; color:#ddd; margin-top:2px; }}
+.analysis-body .metric .value.pos {{ color:var(--green); }}
+.analysis-body .metric .value.neg {{ color:var(--red); }}
+.analysis-body .sub-section {{ margin-bottom:12px; }}
+.analysis-body .tag {{ display:inline-block; background:#1a1a1a; border:1px solid var(--border2); border-radius:3px; padding:2px 6px; font-size:10px; margin:2px; color:var(--dim); }}
+.analysis-body .tag.win-tag {{ border-color:rgba(0,230,118,0.3); color:var(--green); }}
+.analysis-body .tag.loss-tag {{ border-color:rgba(255,82,82,0.3); color:var(--red); }}
+.analysis-body ul {{ margin:4px 0 4px 16px; padding:0; }}
+.analysis-body li {{ margin:2px 0; }}
+.analysis-body .suggestion {{ background:rgba(255,136,0,0.06); border:1px solid rgba(255,136,0,0.2); border-radius:4px; padding:8px 10px; margin-top:8px; }}
+.analysis-body .suggestion .label {{ color:var(--orange); font-weight:700; }}
+
 /* === Settings Gear === */
 .gear-btn {{ background:none; border:1px solid var(--border2); color:var(--dim); padding:4px 8px; border-radius:4px; cursor:pointer; font-size:14px; font-family:var(--mono); transition:all 0.2s; }}
 .gear-btn:hover {{ border-color:var(--orange); color:var(--orange); }}
@@ -1230,6 +1255,7 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
                     <th>时间</th>
                     <th>信号</th>
                     <th>方向</th>
+                    <th>触发逻辑</th>
                     <th>入场价</th>
                     <th>止损</th>
                     <th>目标</th>
@@ -1243,6 +1269,15 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
             <tbody id="signalTableBody"></tbody>
         </table>
     </div>
+</div>
+
+<!-- Signal Analysis -->
+<div class="signal-analysis-section">
+    <div class="chart-header">
+        <span class="title">📊 信号历史整体分析</span>
+        <span class="stats" id="analysisStats">自动生成</span>
+    </div>
+    <div id="signalAnalysis" class="analysis-body"></div>
 </div>
 
 <!-- Footer -->
@@ -1472,7 +1507,7 @@ function renderSignalTable() {
     if (!tbody) return;
     
     if (!SIG_HISTORY || SIG_HISTORY.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--dim);padding:20px">暂无历史信号记录</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim);padding:20px">暂无历史信号记录</td></tr>';
         return;
     }
     
@@ -1482,10 +1517,13 @@ function renderSignalTable() {
         const dirClass = s.type === 'long' ? 'long-tag' : 'short-tag';
         const dirText = s.type === 'long' ? '做多' : '做空';
         const pnlClass = s.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        const reasonText = s.reason || '--';
+        const globalDirText = s.global_dir === 'up' ? '↑UP' : s.global_dir === 'down' ? '↓DOWN' : 'RANGE';
         return `<tr>
             <td>${s.time}</td>
             <td><strong>${s.signal}</strong></td>
             <td class="${dirClass}">${dirText}</td>
+            <td style="font-size:10px;color:#999;max-width:280px;white-space:normal">${reasonText}<br><span style="color:var(--dim2)">1H方向:${globalDirText}</span></td>
             <td>${s.entry.toFixed(2)}</td>
             <td>${s.stop.toFixed(2)}</td>
             <td>${s.target.toFixed(2)}</td>
@@ -1496,6 +1534,149 @@ function renderSignalTable() {
             <td>${s.bars_after}</td>
         </tr>`;
     }).join('');
+    
+    renderAnalysis();
+}
+
+function renderAnalysis() {
+    const el = document.getElementById('signalAnalysis');
+    if (!el) return;
+    
+    if (!SIG_HISTORY || SIG_HISTORY.length === 0) {
+        el.innerHTML = '<div style="text-align:center;color:var(--dim);padding:20px">暂无信号数据，无法分析</div>';
+        return;
+    }
+    
+    const all = SIG_HISTORY;
+    const completed = all.filter(s => s.result === 'win' || s.result === 'loss');
+    const ongoing = all.filter(s => s.result === 'ongoing');
+    const wins = completed.filter(s => s.result === 'win');
+    const losses = completed.filter(s => s.result === 'loss');
+    const longs = all.filter(s => s.type === 'long');
+    const shorts = all.filter(s => s.type === 'short');
+    const longCompleted = longs.filter(s => s.result !== 'ongoing');
+    const shortCompleted = shorts.filter(s => s.result !== 'ongoing');
+    const longWins = longCompleted.filter(s => s.result === 'win');
+    const shortWins = shortCompleted.filter(s => s.result === 'win');
+    
+    const winrate = completed.length > 0 ? (wins.length / completed.length * 100) : 0;
+    const longWinrate = longCompleted.length > 0 ? (longWins.length / longCompleted.length * 100) : 0;
+    const shortWinrate = shortCompleted.length > 0 ? (shortWins.length / shortCompleted.length * 100) : 0;
+    const totalPnl = completed.reduce((sum, s) => sum + s.pnl, 0);
+    const avgWin = wins.length > 0 ? wins.reduce((sum, s) => sum + s.pnl, 0) / wins.length : 0;
+    const avgLoss = losses.length > 0 ? losses.reduce((sum, s) => sum + s.pnl, 0) / losses.length : 0;
+    const avgBars = completed.length > 0 ? completed.reduce((sum, s) => sum + s.bars_after, 0) / completed.length : 0;
+    const profitFactor = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
+    
+    // 信号类型统计
+    const sigTypes = {};
+    all.forEach(s => {
+        const key = s.signal;
+        if (!sigTypes[key]) sigTypes[key] = {total: 0, wins: 0, losses: 0, ongoing: 0, pnl: 0};
+        sigTypes[key].total++;
+        if (s.result === 'win') { sigTypes[key].wins++; sigTypes[key].pnl += s.pnl; }
+        else if (s.result === 'loss') { sigTypes[key].losses++; sigTypes[key].pnl += s.pnl; }
+        else sigTypes[key].ongoing++;
+    });
+    
+    // 期望值计算
+    const expectancy = completed.length > 0 ? totalPnl / completed.length : 0;
+    
+    // 生成分析HTML
+    let html = '';
+    
+    // 指标网格
+    html += '<h4>核心指标</h4>';
+    html += '<div class="metric-grid">';
+    html += `<div class="metric"><div class="label">总信号数</div><div class="value">${all.length}</div></div>`;
+    html += `<div class="metric"><div class="label">已完成</div><div class="value">${completed.length}</div></div>`;
+    html += `<div class="metric"><div class="label">进行中</div><div class="value" style="color:var(--yellow)">${ongoing.length}</div></div>`;
+    html += `<div class="metric"><div class="label">胜率</div><div class="value ${winrate >= 50 ? 'pos' : 'neg'}">${winrate.toFixed(0)}%</div></div>`;
+    html += `<div class="metric"><div class="label">总盈亏</div><div class="value ${totalPnl >= 0 ? 'pos' : 'neg'}">${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(1)}点</div></div>`;
+    html += `<div class="metric"><div class="label">期望值/笔</div><div class="value ${expectancy >= 0 ? 'pos' : 'neg'}">${expectancy >= 0 ? '+' : ''}${expectancy.toFixed(1)}点</div></div>`;
+    html += `<div class="metric"><div class="label">盈亏比(PF)</div><div class="value ${profitFactor >= 1 ? 'pos' : 'neg'}">${profitFactor.toFixed(2)}</div></div>`;
+    html += `<div class="metric"><div class="label">平均持仓</div><div class="value">${avgBars.toFixed(0)}根</div></div>`;
+    html += `<div class="metric"><div class="label">平均盈利</div><div class="value pos">+${avgWin.toFixed(1)}</div></div>`;
+    html += `<div class="metric"><div class="label">平均亏损</div><div class="value neg">${avgLoss.toFixed(1)}</div></div>`;
+    html += '</div>';
+    
+    // 多空对比
+    html += '<h4>多空对比</h4>';
+    html += '<div class="metric-grid">';
+    html += `<div class="metric"><div class="label">做多信号</div><div class="value" style="color:var(--green)">${longs.length}笔</div></div>`;
+    html += `<div class="metric"><div class="label">做多胜率</div><div class="value ${longWinrate >= 50 ? 'pos' : 'neg'}">${longCompleted.length > 0 ? longWinrate.toFixed(0) + '%' : '--'}</div></div>`;
+    html += `<div class="metric"><div class="label">做空信号</div><div class="value" style="color:var(--red)">${shorts.length}笔</div></div>`;
+    html += `<div class="metric"><div class="label">做空胜率</div><div class="value ${shortWinrate >= 50 ? 'pos' : 'neg'}">${shortCompleted.length > 0 ? shortWinrate.toFixed(0) + '%' : '--'}</div></div>`;
+    html += '</div>';
+    
+    // 信号类型分解
+    html += '<h4>信号类型分解</h4>';
+    html += '<div style="margin-bottom:10px">';
+    Object.keys(sigTypes).forEach(key => {
+        const t = sigTypes[key];
+        const wr = (t.wins + t.losses) > 0 ? (t.wins / (t.wins + t.losses) * 100) : 0;
+        const cls = wr >= 50 ? 'win-tag' : 'loss-tag';
+        html += `<span class="tag ${cls}">${key}: ${t.total}笔 | ${t.wins}W/${t.losses}L | 胜率${wr.toFixed(0)}% | PNL${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(1)}</span>`;
+    });
+    html += '</div>';
+    
+    // 诊断与建议
+    html += '<h4>诊断与改进建议</h4>';
+    const suggestions = [];
+    
+    if (completed.length < 10) {
+        suggestions.push(`样本量不足: 仅${completed.length}笔已完成交易，统计意义有限，建议积累至少30笔再评估策略有效性`);
+    }
+    if (winrate < 40 && completed.length >= 5) {
+        suggestions.push(`胜率偏低(${winrate.toFixed(0)}%): 入场条件可能过于宽松，考虑提高H1/L1的实体占比阈值(当前0.6)或增加额外过滤条件`);
+    }
+    if (profitFactor < 1 && completed.length >= 5) {
+        suggestions.push(`盈亏比<1(${profitFactor.toFixed(2)}): 总体亏损，需优化止损距离(ATR×1.6)或止盈倍数(当前1.5R)`);
+    }
+    if (Math.abs(longWinrate - shortWinrate) > 30 && longCompleted.length >= 3 && shortCompleted.length >= 3) {
+        const better = longWinrate > shortWinrate ? '做多' : '做空';
+        const worse = longWinrate > shortWinrate ? '做空' : '做多';
+        suggestions.push(`${better}显著优于${worse}: 多空胜率差距${Math.abs(longWinrate - shortWinrate).toFixed(0)}%，可能存在方向偏好，检查1H方向判断逻辑`);
+    }
+    if (avgBars >= 50) {
+        suggestions.push(`持仓时间偏长(${avgBars.toFixed(0)}根5min K线≈${(avgBars*5/60).toFixed(1)}小时): 信号可能入场时机偏早，等待更明确的突破确认`);
+    }
+    if (ongoing.length > 5) {
+        suggestions.push(`过多进行中信号(${ongoing.length}笔): 可能是止盈/止损距离过远，或信号频繁但趋势不明显`);
+    }
+    // 检查连续亏损
+    let maxConsecLoss = 0, curConsec = 0;
+    completed.forEach(s => {
+        if (s.result === 'loss') { curConsec++; maxConsecLoss = Math.max(maxConsecLoss, curConsec); }
+        else curConsec = 0;
+    });
+    if (maxConsecLoss >= 3) {
+        suggestions.push(`最大连续亏损${maxConsecLoss}笔: 需要风控机制应对连续亏损，建议单日最大亏损2R后停止交易`);
+    }
+    if (suggestions.length === 0 && completed.length >= 10) {
+        suggestions.push('策略表现稳定，继续保持当前规则执行');
+    }
+    
+    html += '<div class="suggestion"><span class="label">改进建议:</span><ul>';
+    suggestions.forEach(s => html += `<li>${s}</li>`);
+    html += '</ul></div>';
+    
+    // 后续完善方向
+    html += '<h4>后续完善方向</h4>';
+    html += '<ul>';
+    html += '<li><strong>方向判断优化:</strong> 当前历史回扫用全局1H方向，应改为滑动窗口方向判断，每个信号点用其前方的1H结构</li>';
+    html += '<li><strong>信号去重:</strong> 当前5根K线去重可能过于简单，应结合实际波动幅度动态调整去重间隔</li>';
+    html += '<li><strong>趋势日/震荡日区分:</strong> 历史回扫未区分趋势日/震荡日，应引入R4三条件判断每个信号当时的模式</li>';
+    html += '<li><strong>止盈优化:</strong> 当前固定1.5R止盈，可考虑动态止盈(ATR扩展或移动止损)</li>';
+    html += '<li><strong>时段过滤:</strong> 加入交易时段过滤，排除亚盘低波动时段的虚假信号</li>';
+    html += '<li><strong>信号标注:</strong> 在5min图上标注信号点的止损/目标位，可视化每笔交易的完整路径</li>';
+    html += '</ul>';
+    
+    el.innerHTML = html;
+    
+    // 更新统计
+    const statsEl = document.getElementById('analysisStats');
+    if (statsEl) statsEl.textContent = `${completed.length}笔完成 · ${ongoing.length}笔进行中 · 期望值${expectancy >= 0 ? '+' : ''}${expectancy.toFixed(1)}点/笔`;
 }
 
 // 加载 Lightweight Charts SDK
