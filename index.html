@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XAU/USD Trading Terminal</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0a0a; color:#666; font-family:'SF Mono',Menlo,Consolas,monospace; font-size:14px; display:flex; justify-content:center; align-items:center; min-height:100vh; }
+.loader { text-align:center; }
+.loader .spinner { width:40px; height:40px; border:3px solid #1e1e1e; border-top-color:#ff8800; border-radius:50%; animation:spin 0.8s linear infinite; margin:0 auto 16px; }
+.loader .text { color:#666; font-size:12px; letter-spacing:1px; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.error { color:#ff5252; text-align:center; padding:40px; }
+</style>
+</head>
+<body>
+<div class="loader" id="loader">
+    <div class="spinner"></div>
+    <div class="text">FETCHING MARKET DATA...</div>
+</div>
+<div id="app"></div>
+
+<script>
+async function loadReport() {
+    try {
+        const r = await fetch('/api/scan', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const html = await r.text();
+        document.getElementById('loader').style.display = 'none';
+        document.getElementById('app').innerHTML = html;
+        // 执行注入的 script
+        const scripts = document.getElementById('app').querySelectorAll('script');
+        scripts.forEach(oldScript => {
+            const newScript = document.createElement('script');
+            newScript.textContent = oldScript.textContent;
+            oldScript.parentNode.replaceChild(newScript, oldScript);
+        });
+    } catch(e) {
+        document.getElementById('loader').innerHTML = '<div class="error">❌ 数据加载失败: ' + e.message + '<br><br><button onclick="location.reload()" style="background:#111;border:1px solid #2a2a2a;color:#ff8800;padding:8px 20px;border-radius:4px;cursor:pointer;font-family:inherit">重新加载</button></div>';
+    }
+}
+loadReport();
+
+// 自动刷新 5 分钟
+setTimeout(function() { location.reload(); }, 300000);
+</script>
+</body>
+</html>
