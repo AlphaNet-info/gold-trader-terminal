@@ -1460,7 +1460,7 @@ function loadScript(src) {
     });
 }
 
-loadScript('https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js')
+loadScript('https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js')
     .then(() => {
         loadChart();
         renderSignalTable();
