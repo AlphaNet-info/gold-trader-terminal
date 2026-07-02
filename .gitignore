@@ -3,3 +3,4 @@ __pycache__/
 state.json
 engine.log
 .vercel/
+.vercel
