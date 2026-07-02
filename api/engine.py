@@ -1460,7 +1460,7 @@ function loadScript(src) {
     });
 }
 
-loadScript('https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js')
+loadScript('https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js')
     .then(() => {
         loadChart();
         renderSignalTable();
@@ -1468,7 +1468,7 @@ loadScript('https://unpkg.com/lightweight-charts/dist/lightweight-charts.standal
     .catch(e => {
         console.error('Failed to load Lightweight Charts:', e);
         const container = document.getElementById('tradingChart');
-        if (container) container.innerHTML = '<div style="padding:20px;color:var(--dim);text-align:center">图表加载失败，请检查网络</div>';
+        if (container) container.innerHTML = '<div style="padding:20px;color:#ff5252;text-align:center">图表加载失败: ' + (e.message || e) + '<br><span style="color:#666">CDN: jsdelivr.net/lightweight-charts</span></div>';
     });
 </script>'''
     html = html.replace('__SCRIPT_PLACEHOLDER__', js_code)
