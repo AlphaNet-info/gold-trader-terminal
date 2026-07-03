@@ -78,6 +78,16 @@ def cron_scan():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route('/api/trades', methods=['GET'])
+def get_trades():
+    """查看持久化交易记录"""
+    try:
+        state = engine.load_state()
+        trades = state.get("trade_results", [])
+        return jsonify({"ok": True, "count": len(trades), "trades": trades})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 # Vercel Python runtime entry point
 if __name__ == '__main__':
     app.run(debug=True)

@@ -4,7 +4,7 @@ Gold Trading Decision Engine — XAU/USD
 规则引擎：获取 GC=F 数据，按 9 条交易规则逐项判断，生成 HTML 报告 + Telegram 推送。
 Author: QClaw | 2026-07-01
 """
-import os, sys, json, math, datetime as dt
+import os, sys, json, math, datetime as dt, base64
 from typing import List, Dict, Any, Optional, Tuple
 
 import requests
@@ -14,6 +14,11 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
 REPORT_PATH = os.environ.get("REPORT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.html"))
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine.log")
+
+# GitHub repo for persistent state (Vercel 无状态环境)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "AlphaNet-info/gold-trader-terminal")
+GITHUB_STATE_PATH = "state.json"
 
 # ---------------- Config & State ----------------
 
@@ -32,20 +37,67 @@ def load_config() -> Dict[str, Any]:
         cfg["telegram_enabled"] = os.environ["TELEGRAM_ENABLED"].lower() in ("true", "1", "yes")
     return cfg
 
+def _github_state_get() -> Optional[Dict]:
+    """从 GitHub repo 读取 state.json"""
+    if not GITHUB_TOKEN:
+        return None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STATE_PATH}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            state = json.loads(content)
+            state["_gh_sha"] = data["sha"]  # 保存 sha 用于后续更新
+            return state
+        return None
+    except Exception as e:
+        log(f"GitHub state 读取失败: {e}")
+        return None
+
+def _github_state_put(state: Dict) -> bool:
+    """写入 state.json 到 GitHub repo"""
+    if not GITHUB_TOKEN:
+        return False
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STATE_PATH}"
+    sha = state.pop("_gh_sha", None)
+    content = base64.b64encode(json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    payload = {"message": f"state update {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}", "content": content}
+    if sha:
+        payload["sha"] = sha
+    try:
+        r = requests.put(url, json=payload, headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}, timeout=10)
+        if r.status_code in (200, 201):
+            # 更新 sha
+            state["_gh_sha"] = r.json()["content"]["sha"]
+            return True
+        log(f"GitHub state 写入失败: HTTP {r.status_code} {r.text[:200]}")
+        return False
+    except Exception as e:
+        log(f"GitHub state 写入异常: {e}")
+        return False
+
 def load_state() -> Dict[str, Any]:
     default_state = {
         "last_signal_ts": None, "signals_today": [], "daily_loss_R": 0.0, "trade_date": None,
         "consecutive_loss_dir": None, "consecutive_loss_count": 0,
         "flipped_today": False, "stopped_today": False,
-        "pending_flip_check": False,  # 连亏3笔但大盘方向未改, 等待确认
+        "pending_flip_check": False,
         "trade_results": [],
     }
+    # 优先从 GitHub 读取 (Vercel 无状态)
+    gh_state = _github_state_get()
+    if gh_state is not None:
+        for k, v in default_state.items():
+            if k not in gh_state:
+                gh_state[k] = v
+        return gh_state
+    # 降级到本地文件
     if not os.path.exists(STATE_PATH):
         return default_state
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-            # 合并默认值
             for k, v in default_state.items():
                 if k not in loaded:
                     loaded[k] = v
@@ -54,6 +106,10 @@ def load_state() -> Dict[str, Any]:
         return default_state
 
 def save_state(state: Dict[str, Any]) -> None:
+    # 优先写 GitHub (Vercel 无状态)
+    if _github_state_put(state):
+        return
+    # 降级到本地文件
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
@@ -2134,14 +2190,47 @@ def run_engine(manual_override: str = None) -> dict:
     # 推送逻辑
     should_push = False
     push_reason = ""
+    state = result.get("state", {})
+    
     if not in_window:
         push_reason = "不在交易时段"
     elif result["all_pass"]:
-        should_push = True
-        push_reason = "全部条件满足, 推送信号"
+        # 检查是否同一信号已推送过（防重复）
+        sig_key = f"{result['direction']}_{result['signal']['signal']}_{result['signal']['type']}"
+        recent = state.get("signals_today", [])
+        last_sig_ts = state.get("last_signal_ts")
+        now_ts = dt.datetime.now().timestamp()
+        if last_sig_ts and (now_ts - last_sig_ts) < 1800 and any(s.get("key") == sig_key for s in recent):
+            push_reason = f"30分钟内已推送过相同信号 {sig_key}, 跳过"
+        else:
+            should_push = True
+            push_reason = "全部条件满足, 推送信号"
+            state.setdefault("signals_today", []).append({"key": sig_key, "ts": now_ts, "time": result["now"]})
+            state["last_signal_ts"] = now_ts
+            # 记录交易到 trade_results
+            trade_record = {
+                "date": result["now"],
+                "direction": result["direction"],
+                "signal": result["signal"]["signal"],
+                "type": result["signal"].get("type", ""),
+                "entry_price": result.get("entry_price"),
+                "stop_price": result.get("stop_price"),
+                "target_price": result.get("target_price"),
+                "stop_distance": result.get("stop_distance", 0),
+                "day_mode": result["day_mode"],
+                "detail": result["signal"].get("detail", ""),
+                "sig_key": sig_key,
+            }
+            state.setdefault("trade_results", []).append(trade_record)
+            # 限制最多 500 条
+            if len(state["trade_results"]) > 500:
+                state["trade_results"] = state["trade_results"][-500:]
     else:
         push_reason = f"{sum(1 for v in result['checks'].values() if not v['pass'])} 项未满足"
-
+    
+    # 持久化 state (GitHub API 或本地文件)
+    save_state(state)
+    
     if should_push:
         try:
             msg = build_signal_message(result)
