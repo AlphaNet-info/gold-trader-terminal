@@ -1796,6 +1796,12 @@ function renderAnalysis() {
     // 生成分析HTML
     let html = '';
     
+    // 预计算分类统计 (用于指标网格和后续分析)
+    const flippedSignals = all.filter(s => s.sim_action === 'flipped');
+    const skippedSignals = all.filter(s => s.sim_action === 'skipped_stopped');
+    const pendingSignals = all.filter(s => s.sim_action === 'skipped_pending' || s.sim_action === 'pending');
+    const normalSignals = all.filter(s => s.sim_action === 'normal');
+    
     // 指标网格
     html += '<h4>核心指标</h4>';
     html += '<div class="metric-grid">';
@@ -1839,11 +1845,6 @@ function renderAnalysis() {
     const suggestions = [];
     
     // 连亏反手统计
-    const flippedSignals = all.filter(s => s.sim_action === 'flipped');
-    const skippedSignals = all.filter(s => s.sim_action === 'skipped_stopped');
-    const pendingSignals = all.filter(s => s.sim_action === 'skipped_pending' || s.sim_action === 'pending');
-    const normalSignals = all.filter(s => s.sim_action === 'normal');
-    
     if (flippedSignals.length > 0 || skippedSignals.length > 0 || pendingSignals.length > 0) {
         suggestions.push(`连亏反手模拟: ${flippedSignals.length}次反手(大盘方向确认), ${pendingSignals.length}次不开仓(大盘方向未改), ${skippedSignals.length}次跳过停止`);
     }
