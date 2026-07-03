@@ -1450,6 +1450,7 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
         <span class="session-dot" style="background:{up_color if checks.get('r2_trading_window',{}).get('pass') else down_color}"></span>
         {result['now']}
     </span>
+    <a href="https://macro-dashboard-taupe.vercel.app/" class="gear-btn" title="返回宏观观察台" style="text-decoration:none">← 返回</a>
     <button class="gear-btn" onclick="openSettings()" title="Telegram 通知设置">⚙</button>
 </div>
 
