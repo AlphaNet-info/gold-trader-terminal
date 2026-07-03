@@ -487,9 +487,22 @@ def scan_signal_history(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str,
             s["sim_action"] = "flipped"
             s["sim_note"] = f"连亏3笔+大盘方向已转→反手"
         elif flip_blocked:
-            s["sim_action"] = "pending"
+            s["sim_action"] = "skipped_pending"
             market_text = {'up': '↑', 'down': '↓', 'range': '→'}.get(s.get("global_dir", ""), s.get("global_dir", ""))
-            s["sim_note"] = f"连亏{sim_consec_count}笔但大盘方向={market_text}未改→等待确认"
+            s["sim_note"] = f"连亏{sim_consec_count}笔, 大盘={market_text}未改→不开仓等待"
+            # pending 状态下不开仓, 但仍需追踪信号结果以判断连亏是否应该重置
+            # 如果信号结果为win, 说明方向对了, 重置连亏; 如果loss, 连亏继续累加
+            if s["result"] == "loss":
+                if sim_consec_dir == s["type"]:
+                    sim_consec_count += 1
+                else:
+                    sim_consec_dir = s["type"]
+                    sim_consec_count = 1
+            elif s["result"] == "win":
+                sim_consec_dir = None
+                sim_consec_count = 0
+                sim_pending = False
+            continue
         else:
             s["sim_action"] = "normal"
             s["sim_note"] = ""
@@ -752,11 +765,11 @@ def check_rules(cfg: Dict, bars_1h: List, bars_5m: List) -> Dict[str, Any]:
             state["flipped_today"] = True
             state["pending_flip_check"] = False
         else:
-            # 大盘方向未改变 → 不反手, 等待大盘方向改变
+            # 大盘方向未改变 → 不开仓, 等待大盘方向改变
             state["pending_flip_check"] = True
             market_dir_text = {'up': '向上', 'down': '向下', 'range': '震荡'}.get(market_dir, market_dir)
-            direction_override_reason = f"{consec_loss_dir}方向连亏{consec_loss_count}笔, 但大盘1H方向={market_dir_text}未改变 → 暂不反手, 等待大盘方向确认"
-            # 不覆盖方向, 继续用原方向, 但标记 pending
+            direction_override = "none"
+            direction_override_reason = f"{consec_loss_dir}方向连亏{consec_loss_count}笔, 大盘1H方向={market_dir_text}未改变 → 不开仓, 等待大盘方向确认"
     elif flipped_today and consec_loss_count >= 2:
         # 反手后又亏2笔 → 停止
         direction_override = "none"
@@ -1705,8 +1718,11 @@ function renderSignalTable() {
         } else if (s.sim_action === 'skipped_stopped') {
             actionText = '⛔ 跳过';
             actionClass = 'style="color:var(--red);font-weight:700"';
+        } else if (s.sim_action === 'skipped_pending') {
+            actionText = '⏸ 不开仓';
+            actionClass = 'style="color:var(--yellow);font-weight:700"';
         } else if (s.sim_action === 'pending') {
-            actionText = '⏸ 待确认';
+            actionText = '⏸ 不开仓';
             actionClass = 'style="color:var(--yellow);font-weight:700"';
         } else if (s.sim_action === 'normal') {
             actionText = '✓ 正常';
@@ -1825,11 +1841,11 @@ function renderAnalysis() {
     // 连亏反手统计
     const flippedSignals = all.filter(s => s.sim_action === 'flipped');
     const skippedSignals = all.filter(s => s.sim_action === 'skipped_stopped');
-    const pendingSignals = all.filter(s => s.sim_action === 'pending');
+    const pendingSignals = all.filter(s => s.sim_action === 'skipped_pending' || s.sim_action === 'pending');
     const normalSignals = all.filter(s => s.sim_action === 'normal');
     
     if (flippedSignals.length > 0 || skippedSignals.length > 0 || pendingSignals.length > 0) {
-        suggestions.push(`连亏反手模拟: ${flippedSignals.length}次反手(大盘方向确认), ${pendingSignals.length}次待确认(大盘方向未改), ${skippedSignals.length}次跳过停止`);
+        suggestions.push(`连亏反手模拟: ${flippedSignals.length}次反手(大盘方向确认), ${pendingSignals.length}次不开仓(大盘方向未改), ${skippedSignals.length}次跳过停止`);
     }
     
     // 反手后的表现
