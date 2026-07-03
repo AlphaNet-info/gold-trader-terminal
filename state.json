@@ -1,0 +1,13 @@
+{
+  "last_signal_ts": null,
+  "signals_today": [],
+  "daily_loss_R": 0.0,
+  "trade_date": null,
+  "consecutive_loss_dir": null,
+  "consecutive_loss_count": 0,
+  "flipped_today": false,
+  "stopped_today": false,
+  "pending_flip_check": false,
+  "trade_results": [],
+  "_test_ts": "2026-07-03"
+}
