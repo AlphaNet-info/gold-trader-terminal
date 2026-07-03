@@ -560,7 +560,7 @@ def is_news_blackout() -> Tuple[bool, str]:
     这里先留接口，默认不屏蔽。"""
     return False, "今日无已知重大数据发布（需手动维护经济日历）"
 
-def check_rules(cfg: Dict, bars_1h: List, bars_5m: List) -> Dict[str, Any]:
+def check_rules(cfg: Dict, bars_1h: List, bars_5m: List, manual_override: str = None) -> Dict[str, Any]:
     now = now_sh()
     checks = {}
 
@@ -776,6 +776,30 @@ def check_rules(cfg: Dict, bars_1h: List, bars_5m: List) -> Dict[str, Any]:
         direction_override_reason = f"反手后{consec_loss_dir}方向再连亏{consec_loss_count}笔 → 今日停止交易"
         stopped_today = True
         state["stopped_today"] = True
+    
+    # === 手动覆盖 (最高优先级) ===
+    if manual_override in ('long', 'short', 'resume'):
+        if manual_override == 'resume':
+            # 恢复自动交易: 清除停止/翻转状态
+            stopped_today = False
+            flipped_today = False
+            consec_loss_count = 0
+            consec_loss_dir = None
+            pending_flip_check = False
+            state["stopped_today"] = False
+            state["flipped_today"] = False
+            state["consecutive_loss_count"] = 0
+            state["consecutive_loss_dir"] = None
+            state["pending_flip_check"] = False
+            direction_override = None
+            direction_override_reason = "手动恢复自动交易"
+        elif manual_override in ('long', 'short'):
+            # 强制方向: 覆盖一切
+            forced_dir = 'up' if manual_override == 'long' else 'down'
+            direction_override = forced_dir
+            direction_override_reason = f"手动覆盖: 强制{'做多' if manual_override == 'long' else '做空'}"
+            stopped_today = False
+            state["stopped_today"] = False
     
     # 应用方向覆盖
     if direction_override == "none":
@@ -1343,6 +1367,19 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
 .modal-footer .btn-primary:hover {{ opacity:0.85; }}
 .modal-footer .btn-test {{ border-color:var(--border2); color:var(--dim); }}
 .modal-footer .btn-test:hover {{ border-color:var(--green); color:var(--green); }}
+/* Control Panel */
+.control-panel {{ background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin: 16px 0; }}
+.cp-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
+.cp-title {{ color: var(--yellow); font-weight: 700; font-size: 13px; letter-spacing: 1px; }}
+.cp-status {{ color: var(--dim); font-size: 12px; }}
+.cp-buttons {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.cp-btn {{ background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; font-family: inherit; transition: all .2s; }}
+.cp-btn:hover {{ border-color: var(--accent); }}
+.cp-btn.long:hover {{ border-color: var(--green); color: var(--green); }}
+.cp-btn.short:hover {{ border-color: var(--red); color: var(--red); }}
+.cp-btn.resume:hover {{ border-color: var(--yellow); color: var(--yellow); }}
+.cp-btn:disabled {{ opacity: .4; cursor: not-allowed; }}
+.cp-btn.loading {{ opacity: .6; pointer-events: none; }}
 </style>
 </head>
 <body>
@@ -1390,6 +1427,20 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
     <div class="tp-card target"><div class="k">Target</div><div class="v">{target_str}</div></div>
     <div class="tp-card rr"><div class="k">R:R Ratio</div><div class="v">{rr_str}</div></div>
     <div class="tp-card signal {'active' if signal_name != 'none' else ''}"><div class="k">Signal</div><div class="v">{signal_name.upper()}</div></div>
+</div>
+
+<!-- Manual Control Panel -->
+<div class="control-panel" id="controlPanel">
+    <div class="cp-header">
+        <span class="cp-title">⚙ 手动控制</span>
+        <span class="cp-status" id="cpStatus">--</span>
+    </div>
+    <div class="cp-buttons">
+        <button class="cp-btn long" onclick="sendOverride('long')">📈 做多</button>
+        <button class="cp-btn short" onclick="sendOverride('short')">📉 做空</button>
+        <button class="cp-btn resume" onclick="sendOverride('resume')">🔄 恢复自动</button>
+        <button class="cp-btn refresh" onclick="refreshPage()">🔄 刷新</button>
+    </div>
 </div>
 
 <!-- R4 Intersection -->
@@ -1514,6 +1565,63 @@ __SCRIPT_PLACEHOLDER__
     # JS 部分包含大量花括号，不能放在 f-string 中
     js_code = '''<script>
 let tgEnabled = false;
+let currentOverride = localStorage.getItem('manual_override') || null;
+
+// 更新控制面板状态显示
+function updateCpStatus() {
+    const el = document.getElementById('cpStatus');
+    if (!el) return;
+    if (currentOverride === 'long') el.textContent = '强制做多';
+    else if (currentOverride === 'short') el.textContent = '强制做空';
+    else if (currentOverride === 'resume') el.textContent = '已恢复自动';
+    else el.textContent = '自动模式';
+}
+updateCpStatus();
+
+// 发送手动覆盖指令
+async function sendOverride(action) {
+    const btns = document.querySelectorAll('.cp-btn');
+    btns.forEach(b => b.classList.add('loading'));
+    try {
+        // 存到 localStorage
+        if (action === 'resume') {
+            localStorage.removeItem('manual_override');
+            currentOverride = null;
+        } else {
+            localStorage.setItem('manual_override', action);
+            currentOverride = action;
+        }
+        // 带 override 参数重新加载
+        const url = '/scan?override=' + encodeURIComponent(action);
+        const r = await fetch(url);
+        const html = await r.text();
+        document.open();
+        document.write(html);
+        document.close();
+    } catch (e) {
+        alert('发送失败: ' + e.message);
+    } finally {
+        btns.forEach(b => b.classList.remove('loading'));
+    }
+}
+
+// 刷新页面 (不带 override, 用 localStorage 中的值)
+function refreshPage() {
+    const override = localStorage.getItem('manual_override');
+    const url = override ? '/scan?override=' + encodeURIComponent(override) : '/scan';
+    window.location.href = url;
+}
+
+// 页面加载时自动带 localStorage 中的 override
+(function autoApplyOverride() {
+    const override = localStorage.getItem('manual_override');
+    const urlParams = new URLSearchParams(window.location.search);
+    const hasOverrideParam = urlParams.has('override');
+    if (override && !hasOverrideParam) {
+        // 自动刷新带 override
+        window.location.replace('/scan?override=' + encodeURIComponent(override));
+    }
+})();
 
 async function loadSettings() {
     try {
@@ -1995,8 +2103,10 @@ def build_signal_message(result: Dict) -> str:
 
 # ---------------- Main ----------------
 
-def run_engine() -> dict:
-    """供 serverless 调用：执行引擎并返回 HTML + result，不写文件"""
+def run_engine(manual_override: str = None) -> dict:
+    """供 serverless 调用：执行引擎并返回 HTML + result，不写文件
+    manual_override: None=自动, 'long'=强制做多, 'short'=强制做空, 'resume'=恢复自动交易
+    """
     cfg = load_config()
     # Vercel 环境变量覆盖
     if os.environ.get("TELEGRAM_BOT_TOKEN"):
@@ -2013,7 +2123,7 @@ def run_engine() -> dict:
     r5m = fetch_yahoo(cfg["symbol_yahoo"], cfg["data_range_5m"], cfg["data_interval_5m"])
     bars_5m = to_bars(r5m)
 
-    result = check_rules(cfg, bars_1h, bars_5m)
+    result = check_rules(cfg, bars_1h, bars_5m, manual_override=manual_override)
     
     # 扫描历史信号
     atr_5m = result.get("atr_5m", 10.0)

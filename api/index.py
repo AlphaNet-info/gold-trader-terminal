@@ -11,7 +11,8 @@ app = Flask(__name__)
 def scan():
     """拉取最新数据 + 规则引擎 + 返回 HTML"""
     try:
-        data = engine.run_engine()
+        override = request.args.get('override', None)  # long/short/resume
+        data = engine.run_engine(manual_override=override)
         return Response(data["html"], mimetype="text/html; charset=utf-8",
                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
     except Exception as e:
