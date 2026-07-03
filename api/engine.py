@@ -33,13 +33,24 @@ def load_config() -> Dict[str, Any]:
     return cfg
 
 def load_state() -> Dict[str, Any]:
+    default_state = {
+        "last_signal_ts": None, "signals_today": [], "daily_loss_R": 0.0, "trade_date": None,
+        "consecutive_loss_dir": None, "consecutive_loss_count": 0,
+        "flipped_today": False, "stopped_today": False,
+        "trade_results": [],  # 记录每笔交易结果用于连亏追踪
+    }
     if not os.path.exists(STATE_PATH):
-        return {"last_signal_ts": None, "signals_today": [], "daily_loss_R": 0.0, "trade_date": None}
+        return default_state
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            loaded = json.load(f)
+            # 合并默认值
+            for k, v in default_state.items():
+                if k not in loaded:
+                    loaded[k] = v
+            return loaded
     except Exception:
-        return {"last_signal_ts": None, "signals_today": [], "daily_loss_R": 0.0, "trade_date": None}
+        return default_state
 
 def save_state(state: Dict[str, Any]) -> None:
     try:
@@ -415,6 +426,64 @@ def scan_signal_history(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str,
         last_sig_key = key
         last_sig_idx = i
     
+    # === 连亏反手模拟 ===
+    # 按时间顺序遍历已完成信号，模拟实盘中的连亏反手机制
+    # 规则: 同方向连亏3笔 → 反手方向; 反手后再亏2笔 → 停止(标记后续信号为skipped)
+    sim_consec_dir = None  # 当前连亏方向 (long/short)
+    sim_consec_count = 0
+    sim_flipped = False
+    sim_stopped = False
+    sim_stop_date = None  # 停止交易的日期
+    
+    for s in deduped:
+        trade_date = s["time"][:5]  # MM-DD
+        
+        # 新的一天重置停止状态
+        if sim_stop_date and trade_date != sim_stop_date:
+            sim_stopped = False
+            sim_stop_date = None
+            sim_consec_dir = None
+            sim_consec_count = 0
+            sim_flipped = False
+        
+        if sim_stopped:
+            s["sim_action"] = "skipped_stopped"
+            s["sim_note"] = "当日已停止交易"
+            continue
+        
+        # 判断当前是否应该反手
+        should_flip = False
+        if sim_consec_count >= 3 and sim_consec_dir and not sim_flipped:
+            should_flip = True
+            sim_flipped = True
+            sim_consec_count = 0
+            sim_consec_dir = None
+        elif sim_consec_count >= 2 and sim_flipped:
+            sim_stopped = True
+            sim_stop_date = trade_date
+            s["sim_action"] = "skipped_stopped"
+            s["sim_note"] = f"反手后连亏{sim_consec_count}笔→停止"
+            continue
+        
+        if should_flip:
+            s["sim_action"] = "flipped"
+            s["sim_note"] = f"连亏3笔→反手为{s['type']}"
+        else:
+            s["sim_action"] = "normal"
+            s["sim_note"] = ""
+        
+        # 更新连亏计数
+        if s["result"] == "loss":
+            if sim_consec_dir == s["type"]:
+                sim_consec_count += 1
+            else:
+                sim_consec_dir = s["type"]
+                sim_consec_count = 1
+        elif s["result"] == "win":
+            sim_consec_dir = None
+            sim_consec_count = 0
+        # ongoing 不影响连亏计数
+    
     return deduped[-max_signals:]
 
 
@@ -609,27 +678,81 @@ def check_rules(cfg: Dict, bars_1h: List, bars_5m: List) -> Dict[str, Any]:
         "trend_dir": trend_dir if is_trend_day else None
     }
 
+    # === 加载状态 (提前到 R5 之前，因为 R5 需要连亏状态) ===
+    state = load_state()
+    today_str = now.strftime("%Y-%m-%d")
+    if state.get("trade_date") != today_str:
+        state["trade_date"] = today_str
+        state["signals_today"] = []
+        state["daily_loss_R"] = 0.0
+        state["consecutive_loss_dir"] = None
+        state["consecutive_loss_count"] = 0
+        state["flipped_today"] = False
+        state["stopped_today"] = False
+
     # Rule 5: 入场信号
     # 趋势日用 R4 的 trend_dir (三因素一致方向)，震荡日用 R3 的 direction
     effective_dir = trend_dir if (is_trend_day and trend_dir in ("向上", "向下")) else direction
     effective_dir_en = "up" if effective_dir == "向上" else "down" if effective_dir == "向下" else effective_dir
     atr_5m = atr(bars_5m, cfg["atr_period"])
-    sig = detect_5min_signal(bars_5m, effective_dir_en, atr_5m)
-    levels = key_levels(bars_5m, bars_1h)
-
-    if is_trend_day:
-        needed = ["H2"] if effective_dir_en == "up" else ["L2"]
+    
+    # === 连续亏损反手机制 ===
+    # state 中跟踪: consecutive_loss_dir (亏损方向), consecutive_loss_count (连续亏损次数)
+    # consecutive_loss_dir_after_flip (反手后的亏损方向), flipped_today (今日是否已反手)
+    # stopped_today (今日是否已停止交易)
+    consec_loss_dir = state.get("consecutive_loss_dir")
+    consec_loss_count = state.get("consecutive_loss_count", 0)
+    flipped_today = state.get("flipped_today", False)
+    stopped_today = state.get("stopped_today", False)
+    
+    direction_override = None
+    direction_override_reason = ""
+    
+    if stopped_today:
+        direction_override = "none"
+        direction_override_reason = f"今日已停止交易 (反手后又连亏2笔)，等待用户指令恢复"
+    elif consec_loss_count >= 3 and consec_loss_dir and not flipped_today:
+        # 同方向连亏3笔 → 反手
+        flipped_dir = "down" if consec_loss_dir == "long" else "up"
+        direction_override = flipped_dir
+        direction_override_reason = f"{consec_loss_dir}方向连亏{consec_loss_count}笔 → 反手为{flipped_dir}方向"
+    elif flipped_today and consec_loss_count >= 2:
+        # 反手后又连亏2笔 → 停止
+        direction_override = "none"
+        direction_override_reason = f"反手后{consec_loss_dir}方向再连亏{consec_loss_count}笔 → 今日停止交易"
+        stopped_today = True
+        state["stopped_today"] = True
+    
+    # 应用方向覆盖
+    if direction_override == "none":
+        effective_dir_en = "none"
+        sig = {"signal": "none", "type": None, "detail": direction_override_reason}
+        signal_ok = False
+        sig_label = "停止交易"
+    elif direction_override:
+        effective_dir_en = direction_override
+        sig = detect_5min_signal(bars_5m, effective_dir_en, atr_5m)
+        if is_trend_day:
+            needed = ["H2"] if effective_dir_en == "up" else ["L2"]
+        else:
+            needed = ["H1"] if effective_dir_en in ("up", "range") else ["L1"]
         signal_ok = sig["signal"] in needed
-        sig_label = f"趋势日需 {'H2(做多)' if effective_dir_en == 'up' else 'L2(做空)'}"
+        sig_label = f"反手强制{'做多' if effective_dir_en == 'up' else '做空'} | " + ("趋势日" if is_trend_day else "震荡日")
     else:
-        needed = ["H1"] if direction in ("up", "range") else ["L1"]
+        sig = detect_5min_signal(bars_5m, effective_dir_en, atr_5m)
+        if is_trend_day:
+            needed = ["H2"] if effective_dir_en == "up" else ["L2"]
+        else:
+            needed = ["H1"] if effective_dir_en in ("up", "range") else ["L1"]
         signal_ok = sig["signal"] in needed
-        sig_label = "震荡日需 H1/L1"
-
+        sig_label = "趋势日需 H2/L2" if is_trend_day else "震荡日需 H1/L1"
+    
+    levels = key_levels(bars_5m, bars_1h)
+    
     checks["r5_entry_signal"] = {
         "label": f"R5 入场信号 ({sig_label})",
         "pass": signal_ok,
-        "detail": f"{sig['detail']} | 关键位: {levels['detail']}"
+        "detail": f"{sig['detail']} | 关键位: {levels['detail']}" + (f" | ⚠ {direction_override_reason}" if direction_override_reason else "")
     }
 
     # Rule 6: 止损
@@ -675,20 +798,29 @@ def check_rules(cfg: Dict, bars_1h: List, bars_5m: List) -> Dict[str, Any]:
     }
 
     # Rule 8: 资金风控
-    state = load_state()
-    # 日重置
-    today_str = now.strftime("%Y-%m-%d")
-    if state.get("trade_date") != today_str:
-        state["trade_date"] = today_str
-        state["signals_today"] = []
-        state["daily_loss_R"] = 0.0
     daily_loss = state.get("daily_loss_R", 0.0)
     trades_today = len(state.get("signals_today", []))
-    risk_ok = daily_loss < cfg["daily_max_loss_R"] and trades_today < cfg["max_trades_per_day"]
+    stopped_today = state.get("stopped_today", False)
+    consec_loss_dir = state.get("consecutive_loss_dir")
+    consec_loss_count = state.get("consecutive_loss_count", 0)
+    flipped_today = state.get("flipped_today", False)
+    
+    risk_ok = (not stopped_today) and daily_loss < cfg["daily_max_loss_R"] and trades_today < cfg["max_trades_per_day"]
+    
+    consec_detail = ""
+    if stopped_today:
+        consec_detail = " | ⚠ 今日已停止交易 (连亏反手后再亏2笔)"
+    elif flipped_today and consec_loss_count > 0:
+        consec_detail = f" | ⚠ 已反手为{consec_loss_dir}方向, 反手后连亏{consec_loss_count}笔"
+    elif consec_loss_count >= 3:
+        consec_detail = f" | ⚠ {consec_loss_dir}方向连亏{consec_loss_count}笔, 即将反手"
+    elif consec_loss_count > 0:
+        consec_detail = f" | {consec_loss_dir}方向连亏{consec_loss_count}笔"
+    
     checks["r8_risk"] = {
-        "label": f"R8 当日风控 (已亏 {daily_loss:.2f}R / 上限 {cfg['daily_max_loss_R']}R, 已交易 {trades_today}/{cfg['max_trades_per_day']} 笔)",
+        "label": f"R8 当日风控 (已亏 {daily_loss:.2f}R / 上限 {cfg['daily_max_loss_R']}R, 已交易 {trades_today}/{cfg['max_trades_per_day']} 笔){consec_detail}",
         "pass": risk_ok,
-        "detail": f"{'风控未打满, 可继续' if risk_ok else '风控已打满, 停止交易'}"
+        "detail": f"{'风控未打满, 可继续' if risk_ok else '风控已打满或已停止, 停止交易'}"
     }
 
     # Rule 9: re-entry (美盘不开新仓)
@@ -1264,6 +1396,7 @@ body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-s
                     <th>出场时间</th>
                     <th>盈亏(点)</th>
                     <th>K线数</th>
+                    <th>策略动作</th>
                 </tr>
             </thead>
             <tbody id="signalTableBody"></tbody>
@@ -1507,7 +1640,7 @@ function renderSignalTable() {
     if (!tbody) return;
     
     if (!SIG_HISTORY || SIG_HISTORY.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim);padding:20px">暂无历史信号记录</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--dim);padding:20px">暂无历史信号记录</td></tr>';
         return;
     }
     
@@ -1519,6 +1652,20 @@ function renderSignalTable() {
         const pnlClass = s.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
         const reasonText = s.reason || '--';
         const globalDirText = s.global_dir === 'up' ? '↑UP' : s.global_dir === 'down' ? '↓DOWN' : 'RANGE';
+        // 策略动作
+        let actionText = '--';
+        let actionClass = '';
+        if (s.sim_action === 'flipped') {
+            actionText = '🔄 反手';
+            actionClass = 'style="color:var(--orange);font-weight:700"';
+        } else if (s.sim_action === 'skipped_stopped') {
+            actionText = '⛔ 跳过';
+            actionClass = 'style="color:var(--red);font-weight:700"';
+        } else if (s.sim_action === 'normal') {
+            actionText = '✓ 正常';
+            actionClass = 'style="color:var(--dim)"';
+        }
+        const simNote = s.sim_note ? `<br><span style="font-size:9px;color:var(--dim2)">${s.sim_note}</span>` : '';
         return `<tr>
             <td>${s.time}</td>
             <td><strong>${s.signal}</strong></td>
@@ -1532,6 +1679,7 @@ function renderSignalTable() {
             <td>${s.exit_time || '--'}</td>
             <td class="${pnlClass}">${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(1)}</td>
             <td>${s.bars_after}</td>
+            <td ${actionClass}>${actionText}${simNote}</td>
         </tr>`;
     }).join('');
     
@@ -1598,6 +1746,8 @@ function renderAnalysis() {
     html += `<div class="metric"><div class="label">平均持仓</div><div class="value">${avgBars.toFixed(0)}根</div></div>`;
     html += `<div class="metric"><div class="label">平均盈利</div><div class="value pos">+${avgWin.toFixed(1)}</div></div>`;
     html += `<div class="metric"><div class="label">平均亏损</div><div class="value neg">${avgLoss.toFixed(1)}</div></div>`;
+    html += `<div class="metric"><div class="label">连亏反手</div><div class="value" style="color:var(--orange)">${flippedSignals.length}次</div></div>`;
+    html += `<div class="metric"><div class="label">停止交易</div><div class="value" style="color:var(--red)">${skippedSignals.length}次</div></div>`;
     html += '</div>';
     
     // 多空对比
@@ -1623,6 +1773,30 @@ function renderAnalysis() {
     // 诊断与建议
     html += '<h4>诊断与改进建议</h4>';
     const suggestions = [];
+    
+    // 连亏反手统计
+    const flippedSignals = all.filter(s => s.sim_action === 'flipped');
+    const skippedSignals = all.filter(s => s.sim_action === 'skipped_stopped');
+    const normalSignals = all.filter(s => s.sim_action === 'normal');
+    
+    if (flippedSignals.length > 0 || skippedSignals.length > 0) {
+        suggestions.push(`连亏反手机制触发: ${flippedSignals.length}次反手, ${skippedSignals.length}次跳过停止。反手后信号表现可进一步验证策略有效性`);
+    }
+    
+    // 反手后的表现
+    if (flippedSignals.length > 0) {
+        const afterFlip = all.filter((s, i) => {
+            // 找反手之后的信号
+            const prevFlipped = all.slice(0, i).some(p => p.sim_action === 'flipped');
+            return prevFlipped && s.sim_action !== 'skipped_stopped';
+        });
+        const afterFlipCompleted = afterFlip.filter(s => s.result !== 'ongoing');
+        const afterFlipWins = afterFlipCompleted.filter(s => s.result === 'win');
+        if (afterFlipCompleted.length > 0) {
+            const flipWinrate = (afterFlipWins.length / afterFlipCompleted.length * 100).toFixed(0);
+            suggestions.push(`反手后胜率: ${flipWinrate}% (${afterFlipWins.length}W/${afterFlipCompleted.length - afterFlipWins.length}L), 验证反手策略是否有效`);
+        }
+    }
     
     if (completed.length < 10) {
         suggestions.push(`样本量不足: 仅${completed.length}笔已完成交易，统计意义有限，建议积累至少30笔再评估策略有效性`);
@@ -1670,6 +1844,8 @@ function renderAnalysis() {
     html += '<li><strong>止盈优化:</strong> 当前固定1.5R止盈，可考虑动态止盈(ATR扩展或移动止损)</li>';
     html += '<li><strong>时段过滤:</strong> 加入交易时段过滤，排除亚盘低波动时段的虚假信号</li>';
     html += '<li><strong>信号标注:</strong> 在5min图上标注信号点的止损/目标位，可视化每笔交易的完整路径</li>';
+    html += '<li><strong>连亏反手验证:</strong> 反手机制已实现，需积累更多样本验证反手后胜率是否确实更高</li>';
+    html += '<li><strong>实盘状态同步:</strong> 当前state在Vercel只读，需用外部存储(如KV)同步连亏状态到下次扫描</li>';
     html += '</ul>';
     
     el.innerHTML = html;
