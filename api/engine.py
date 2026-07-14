@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Gold Trading Decision Engine — XAU/USD
-规则引擎：获取 GC=F 数据，按 9 条交易规则逐项判断，生成 HTML 报告 + Telegram 推送。
-Author: QClaw | 2026-07-01
+Gold Trading Decision Engine v2 — XAU/USD
+三套交易方法：
+  1. 裸K交易系统 (EMA21/55/144趋势 + 关键位 + SB结构入场)
+  2. DD结构入场 (趋势 + 61.8%回调 + 双十字星 + EMA20)
+  3. 复杂回调系统 (楔形三推 + 关键位 + SB结构 + 高1/低1入场)
+
+Author: QClaw | 2026-07-14
 """
 import os, sys, json, math, datetime as dt, base64
 from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-# Vercel 环境下 state 用内存或外部存储，不写文件
-STATE_PATH = os.environ.get("STATE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
-REPORT_PATH = os.environ.get("REPORT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.html"))
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine.log")
+# ---------------- Config & State ----------------
 
-# GitHub repo for persistent state (Vercel 无状态环境)
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "AlphaNet-info/gold-trader-terminal")
 GITHUB_STATE_PATH = "state.json"
-
-# ---------------- Config & State ----------------
 
 def load_config() -> Dict[str, Any]:
     try:
@@ -28,7 +28,6 @@ def load_config() -> Dict[str, Any]:
             cfg = json.load(f)
     except Exception:
         cfg = {}
-    # Vercel 环境变量覆盖
     if os.environ.get("TELEGRAM_BOT_TOKEN"):
         cfg["telegram_bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
     if os.environ.get("TELEGRAM_CHAT_ID"):
@@ -37,98 +36,20 @@ def load_config() -> Dict[str, Any]:
         cfg["telegram_enabled"] = os.environ["TELEGRAM_ENABLED"].lower() in ("true", "1", "yes")
     return cfg
 
-def _github_state_get() -> Optional[Dict]:
-    """从 GitHub repo 读取 state.json"""
-    if not GITHUB_TOKEN:
-        return None
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STATE_PATH}"
-    try:
-        r = requests.get(url, headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            content = base64.b64decode(data["content"]).decode("utf-8")
-            state = json.loads(content)
-            state["_gh_sha"] = data["sha"]  # 保存 sha 用于后续更新
-            return state
-        return None
-    except Exception as e:
-        log(f"GitHub state 读取失败: {e}")
-        return None
+def log(msg: str):
+    print(f"[{dt.datetime.now().isoformat()}] {msg}", file=sys.stderr)
 
-def _github_state_put(state: Dict) -> bool:
-    """写入 state.json 到 GitHub repo"""
-    if not GITHUB_TOKEN:
-        return False
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STATE_PATH}"
-    sha = state.pop("_gh_sha", None)
-    content = base64.b64encode(json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8")).decode("ascii")
-    payload = {"message": f"state update {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}", "content": content}
-    if sha:
-        payload["sha"] = sha
-    try:
-        r = requests.put(url, json=payload, headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}, timeout=10)
-        if r.status_code in (200, 201):
-            # 更新 sha
-            state["_gh_sha"] = r.json()["content"]["sha"]
-            return True
-        log(f"GitHub state 写入失败: HTTP {r.status_code} {r.text[:200]}")
-        return False
-    except Exception as e:
-        log(f"GitHub state 写入异常: {e}")
-        return False
+def now_sh() -> dt.datetime:
+    """当前上海时间"""
+    return dt.datetime.utcnow() + dt.timedelta(hours=8)
 
-def load_state() -> Dict[str, Any]:
-    default_state = {
-        "last_signal_ts": None, "signals_today": [], "daily_loss_R": 0.0, "trade_date": None,
-        "consecutive_loss_dir": None, "consecutive_loss_count": 0,
-        "flipped_today": False, "stopped_today": False,
-        "pending_flip_check": False,
-        "trade_results": [],
-    }
-    # 优先从 GitHub 读取 (Vercel 无状态)
-    gh_state = _github_state_get()
-    if gh_state is not None:
-        for k, v in default_state.items():
-            if k not in gh_state:
-                gh_state[k] = v
-        return gh_state
-    # 降级到本地文件
-    if not os.path.exists(STATE_PATH):
-        return default_state
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-            for k, v in default_state.items():
-                if k not in loaded:
-                    loaded[k] = v
-            return loaded
-    except Exception:
-        return default_state
+def to_bjt(utc_dt: dt.datetime) -> dt.datetime:
+    return utc_dt + dt.timedelta(hours=8)
 
-def save_state(state: Dict[str, Any]) -> None:
-    # 优先写 GitHub (Vercel 无状态)
-    if _github_state_put(state):
-        return
-    # 降级到本地文件
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass  # Vercel 只读，忽略
-
-def log(msg: str) -> None:
-    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line, flush=True)
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+def fmt_bjt(utc_dt: dt.datetime, fmt: str = "%m-%d %H:%M") -> str:
+    return to_bjt(utc_dt).strftime(fmt)
 
 # ---------------- Data Fetch ----------------
-
-YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 
 def fetch_yahoo(symbol: str, range_: str, interval: str) -> Dict[str, Any]:
     url = f"{YAHOO_BASE}/{symbol}"
@@ -164,7 +85,27 @@ def to_bars(result: Dict[str, Any]) -> List[Dict[str, float]]:
 
 # ---------------- Indicators ----------------
 
-def atr(bars: List[Dict[str, float]], period: int = 14) -> float:
+def ema(values: List[float], period: int) -> List[Optional[float]]:
+    """EMA 计算，返回与 values 等长的列表，前面不足 period 的为 None"""
+    if not values:
+        return []
+    k = 2.0 / (period + 1)
+    result = [None] * len(values)
+    # 第一个有效值用前 period 个的 SMA
+    if len(values) < period:
+        return result
+    sma = sum(values[:period]) / period
+    result[period - 1] = sma
+    for i in range(period, len(values)):
+        prev = result[i - 1]
+        result[i] = values[i] * k + prev * (1 - k)
+    return result
+
+def ema_of_bars(bars: List[Dict], field: str = "close", period: int = 21) -> List[Optional[float]]:
+    values = [b[field] for b in bars]
+    return ema(values, period)
+
+def atr(bars: List[Dict], period: int = 14) -> float:
     if len(bars) < period + 1:
         return 0.0
     trs = []
@@ -173,1999 +114,935 @@ def atr(bars: List[Dict[str, float]], period: int = 14) -> float:
         pc = bars[i-1]["close"]
         tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(tr)
-    # simple moving average of TR
     return sum(trs[-period:]) / period if len(trs) >= period else (sum(trs) / len(trs) if trs else 0.0)
 
-def points_to_R(points: float, atr_val: float, atr_mult: float = 1.6) -> float:
-    """把点数换算成 R。1R = 止损距离 = max(1.6*ATR, 结构点距离) 这里用 1.6*ATR 近似"""
-    if atr_val <= 0:
-        return 0.0
-    stop_dist = atr_val * atr_mult
-    return points / stop_dist if stop_dist > 0 else 0.0
+def macd(bars: List[Dict], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, List]:
+    closes = [b["close"] for b in bars]
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line = []
+    for i in range(len(closes)):
+        if ema_fast[i] is not None and ema_slow[i] is not None:
+            macd_line.append(ema_fast[i] - ema_slow[i])
+        else:
+            macd_line.append(None)
+    # signal line = EMA of macd_line (only non-None part)
+    valid = [v for v in macd_line if v is not None]
+    sig = ema(valid, signal) if len(valid) >= signal else [None] * len(valid)
+    # align signal back
+    signal_line = [None] * len(closes)
+    idx = 0
+    for i in range(len(closes)):
+        if macd_line[i] is not None:
+            if idx < len(sig):
+                signal_line[i] = sig[idx]
+            idx += 1
+    hist = []
+    for i in range(len(closes)):
+        if macd_line[i] is not None and signal_line[i] is not None:
+            hist.append(macd_line[i] - signal_line[i])
+        else:
+            hist.append(None)
+    return {"macd": macd_line, "signal": signal_line, "hist": hist}
+
+def rsi(bars: List[Dict], period: int = 14) -> List[Optional[float]]:
+    closes = [b["close"] for b in bars]
+    if len(closes) < period + 1:
+        return [None] * len(closes)
+    result = [None] * len(closes)
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        ch = closes[i] - closes[i-1]
+        gains.append(max(ch, 0))
+        losses.append(max(-ch, 0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    result[period] = 100 - (100 / (1 + (avg_gain / avg_loss if avg_loss else 999)))
+    for i in range(period + 1, len(closes)):
+        ch = closes[i] - closes[i-1]
+        gain = max(ch, 0)
+        loss = max(-ch, 0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        if avg_loss == 0:
+            result[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            result[i] = 100 - (100 / (1 + rs))
+    return result
 
 # ---------------- Structure Detection ----------------
 
-def detect_hh_hl(bars: List[Dict[str, float]]) -> Dict[str, Any]:
-    """检测 1h 的 HH/HL (上升趋势) 或 LH/LL (下降趋势)。
-    简化：找最近 N 根中的 swing high/low 序列。
-    """
-    if len(bars) < 5:
-        return {"direction": "unknown", "swings": [], "detail": f"数据不足({len(bars)}根, 需≥5)"}
-
-    # 用 fractal 方法：3 根窗口中中间最高/最低
+def find_swing_highs_lows(bars: List[Dict], window: int = 2) -> Tuple[List[Dict], List[Dict]]:
+    """找 swing high / swing low，window=2 表示左右各2根"""
     highs = [b["high"] for b in bars]
     lows = [b["low"] for b in bars]
-    swing_highs = []
-    swing_lows = []
-    w = 1
-    for i in range(w, len(bars) - w):
-        if highs[i] == max(highs[i-w:i+w+1]):
-            swing_highs.append({"i": i, "price": highs[i], "dt": bars[i]["dt"]})
-        if lows[i] == min(lows[i-w:i+w+1]):
-            swing_lows.append({"i": i, "price": lows[i], "dt": bars[i]["dt"]})
-
+    sh, sl = [], []
+    for i in range(window, len(bars) - window):
+        if highs[i] == max(highs[i-window:i+window+1]):
+            sh.append({"i": i, "price": highs[i], "dt": bars[i]["dt"], "bar": bars[i]})
+        if lows[i] == min(lows[i-window:i+window+1]):
+            sl.append({"i": i, "price": lows[i], "dt": bars[i]["dt"], "bar": bars[i]})
     # 去重连续
     def dedup(swings):
         out = []
         for s in swings:
-            if not out or abs(s["price"] - out[-1]["price"]) > 0.1:
+            if not out or abs(s["price"] - out[-1]["price"]) > 0.05:
                 out.append(s)
         return out
+    return dedup(sh), dedup(sl)
 
-    swing_highs = dedup(swing_highs)
-    swing_lows = dedup(swing_lows)
-
-    # 判定方向：最近两个 swing high 和两个 swing low
-    direction = "range"
-    detail = []
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        sh1, sh2 = swing_highs[-2], swing_highs[-1]
-        sl1, sl2 = swing_lows[-2], swing_lows[-1]
-        hh = sh2["price"] > sh1["price"]
-        hl = sl2["price"] > sl1["price"]
-        lh = sh2["price"] < sh1["price"]
-        ll = sl2["price"] < sl1["price"]
-        detail.append(f"SH1={sh1['price']:.1f} SH2={sh2['price']:.1f} {'HH' if hh else 'LH'}")
-        detail.append(f"SL1={sl1['price']:.1f} SL2={sl2['price']:.1f} {'HL' if hl else 'LL'}")
-        if hh and hl:
-            direction = "up"
-        elif lh and ll:
-            direction = "down"
-
-    return {"direction": direction, "swing_highs": swing_highs[-3:], "swing_lows": swing_lows[-3:], "detail": "; ".join(detail)}
-
-def asian_session_range(bars_1h: List[Dict[str, float]]) -> Dict[str, Any]:
-    """取亚洲时段（GMT+8 08:00-14:00，即 UTC 00:00-06:00）的 high/low。
-    返回亚盘区间 high/low，用于后续突破方向判断。
-    """
-    asian_bars = [b for b in bars_1h if 0 <= b["dt"].hour < 6]
-    today = dt.datetime.utcnow().date()
-    asian_today = [b for b in asian_bars if b["dt"].date() == today]
-    if not asian_today:
-        # 用最近一天
-        if asian_bars:
-            last_date = asian_bars[-1]["dt"].date()
-            asian_today = [b for b in asian_bars if b["dt"].date() == last_date]
-    if not asian_today:
-        return {"high": None, "low": None, "range": 0, "bars": 0, "detail": "无亚盘数据", "open": None, "close": None}
-    h = max(b["high"] for b in asian_today)
-    l = min(b["low"] for b in asian_today)
-    o = asian_today[0]["open"]
-    c = asian_today[-1]["close"]
-    return {"high": h, "low": l, "range": h - l, "bars": len(asian_today),
-            "open": o, "close": c,
-            "detail": f"亚盘 {len(asian_today)} 根 H={h:.1f} L={l:.1f} Range={h-l:.1f} (O={o:.1f} C={c:.1f})"}
-
-def day_move_points(bars_1h: List[Dict[str, float]]) -> Dict[str, Any]:
-    """从亚盘开始到欧盘早段（欧盘开盘后半小时）的幅度，并判断方向（向上/向下/震荡）。
-    
-    时间窗口 (UTC):
-      - 亚盘: 00:00-06:00 (GMT+8 08:00-14:00)
-      - 欧盘早段: 07:00-07:30 (GMT+8 15:00-15:30)
-      - R4 判断窗口: 00:00 - 07:30 UTC
-    
-    判定逻辑：
-      - 只取 UTC 00:00 到 07:30 之间的 K线（欧盘开盘后半小时内）
-      - 开盘价 = 窗口内第一根 K线的 open
-      - 当前价 = 窗口内最后一根 K线的 close
-      - 幅度 = 窗口内 high - low
-      - 方向: 当前价 vs 开盘价，偏差超过幅度 1/3 判定为有方向，否则震荡
-    """
-    today = dt.datetime.utcnow().date()
-    # R4 判断窗口：UTC 00:00 - 07:30
-    # 1h K线: 取 hour < 7 的全部 + hour==7 的（如果有的话，1h K线 hour=7 覆盖 07:00-08:00）
-    # 更精确做法：取 hour < 8 的所有今日 K线（即 UTC 00:00-08:00），
-    # 但只用到 07:30 的数据。由于 1h K线粒度，hour=7 这根代表 07:00-08:00，
-    # 在欧盘开盘后半小时这个时点，这根 K线还在形成中，但我们可以用它作为参考。
-    # 简化：取 UTC hour 0-7 的今日 K线
-    window_bars = [b for b in bars_1h if b["dt"].date() == today and b["dt"].hour <= 7]
-    if not window_bars:
-        # 数据不足，回退到今日全部 K线
-        window_bars = [b for b in bars_1h if b["dt"].date() == today]
-    if not window_bars:
-        return {"points": 0, "detail": "今日无 1h 数据", "direction": "unknown", "open": None, "last": None, "high": None, "low": None}
-    day_high = max(b["high"] for b in window_bars)
-    day_low = min(b["low"] for b in window_bars)
-    day_open = window_bars[0]["open"]
-    day_last = window_bars[-1]["close"]
-    points = day_high - day_low
-    # 方向判定：当前价相对开盘价的偏移 vs 幅度
-    offset = day_last - day_open
-    if points > 0:
-        ratio = abs(offset) / points
+def detect_ema_trend(bars: List[Dict], ema21: List, ema55: List, ema144: List) -> Dict[str, Any]:
+    """EMA 均线组判断趋势：多头排列(21>55>144)=up, 空头排列(144>55>21)=down, 否则=range"""
+    if not bars or ema21[-1] is None or ema55[-1] is None or ema144[-1] is None:
+        return {"direction": "unknown", "detail": "EMA 数据不足"}
+    e21, e55, e144 = ema21[-1], ema55[-1], ema144[-1]
+    price = bars[-1]["close"]
+    if e21 > e55 > e144:
+        direction = "up"
+        detail = f"多头排列 EMA21={e21:.2f} > 55={e55:.2f} > 144={e144:.2f} | 价格={price:.2f}"
+    elif e144 > e55 > e21:
+        direction = "down"
+        detail = f"空头排列 EMA144={e144:.2f} > 55={e55:.2f} > 21={e21:.2f} | 价格={price:.2f}"
     else:
-        ratio = 0
-    if ratio < 0.33:
-        move_dir = "震荡"
-    elif offset > 0:
-        move_dir = "向上"
-    else:
-        move_dir = "向下"
-    window_end = "07:30 UTC (15:30 GMT+8)"
-    return {
-        "points": points, "high": day_high, "low": day_low,
-        "open": day_open, "last": day_last, "offset": offset, "direction": move_dir,
-        "detail": f"窗口: UTC 00:00-{window_end} | H={day_high:.1f} L={day_low:.1f} 幅度={points:.1f}点 | O={day_open:.1f} C={day_last:.1f} 偏移={offset:+.1f} → 方向={move_dir}"
-    }
+        direction = "range"
+        detail = f"均线缠绕 EMA21={e21:.2f}, 55={e55:.2f}, 144={e144:.2f} | 观望"
+    return {"direction": direction, "detail": detail, "ema21": e21, "ema55": e55, "ema144": e144}
 
-def detect_5min_signal(bars_5m: List[Dict[str, float]], direction: str, atr_5m: float) -> Dict[str, Any]:
-    """检测 5min 入场信号 H1/H2。
-    H2 (做多): 连续两根更高的 high + 第二根收盘在第一根 high 附近或以上，且低点不破前低
-    L2 (做空): 连续两根更低的 low + 第二根收盘在第一根 low 附近或以下，且高点不破前高
-    H1 (做多): 单根吞没/强阳线
-    L1 (做空): 单根吞没/强阴线
-    """
-    if len(bars_5m) < 3:
-        return {"signal": "none", "type": None, "detail": "5min 数据不足"}
-
-    last3 = bars_5m[-3:]
-    last2 = bars_5m[-2:]
-    c1, c2 = last2[0], last2[1]
-
-    if direction in ("up", "range"):
-        # H2
-        if c2["high"] > c1["high"] and c2["low"] >= c1["low"] and c2["close"] > c1["close"]:
-            return {"signal": "H2", "type": "long", "detail": f"H2 做多信号: 两根连续抬高，C2 close={c2['close']:.1f} > C1 close={c1['close']:.1f}"}
-        # H1
-        body = c2["close"] - c2["open"]
-        rng = c2["high"] - c2["low"]
-        if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] > c1["high"]:
-            return {"signal": "H1", "type": "long", "detail": f"H1 做多信号: 强阳线 close={c2['close']:.1f}"}
-
-    if direction in ("down", "range"):
-        # L2
-        if c2["low"] < c1["low"] and c2["high"] <= c1["high"] and c2["close"] < c1["close"]:
-            return {"signal": "L2", "type": "short", "detail": f"L2 做空信号: 两根连续降低，C2 close={c2['close']:.1f} < C1 close={c1['close']:.1f}"}
-        # L1
-        body = c2["open"] - c2["close"]
-        rng = c2["high"] - c2["low"]
-        if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] < c1["low"]:
-            return {"signal": "L1", "type": "short", "detail": f"L1 做空信号: 强阴线 close={c2['close']:.1f}"}
-
-    return {"signal": "none", "type": None, "detail": "无 H1/H2/L1/L2 信号"}
-
-def scan_signal_history(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str, float]], atr_5m: float, max_signals: int = 50) -> List[Dict[str, Any]]:
-    """扫描 5min K线历史，检测所有 H1/H2/L1/L2 信号点，并计算事后盈亏。
-    每个信号记录: time, signal_type, direction(long/short), entry_price, stop_price, target_price,
-    之后追踪到止损或止盈，记录结果(win/loss/ongoing)和盈亏点数。
-    """
-    signals = []
-    if len(bars_5m) < 5:
-        return signals
-    
-    # 用 1h 方向作为全局方向参考
-    struct_1h = detect_hh_hl(bars_1h)
-    global_dir = struct_1h.get("direction", "range")
-    
-    for i in range(2, len(bars_5m) - 1):
-        c1 = bars_5m[i - 1]
-        c2 = bars_5m[i]
-        detected = None
-        
-        # 尝试做多信号 (up 或 range 方向)
-        if global_dir in ("up", "range"):
-            # H2
-            if c2["high"] > c1["high"] and c2["low"] >= c1["low"] and c2["close"] > c1["close"]:
-                detected = {"signal": "H2", "type": "long", "entry": c2["close"],
-                           "reason": f"连续两根抬高: H2({c2['high']:.1f})>H1({c1['high']:.1f}), L2({c2['low']:.1f})≥L1({c1['low']:.1f}), Close({c2['close']:.1f})>前Close({c1['close']:.1f})"}
-            # H1
-            else:
-                body = c2["close"] - c2["open"]
-                rng = c2["high"] - c2["low"]
-                if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] > c1["high"]:
-                    detected = {"signal": "H1", "type": "long", "entry": c2["close"],
-                               "reason": f"强阳线吞没: 实体占比{body/rng*100:.0f}%, Close({c2['close']:.1f})>前High({c1['high']:.1f})"}
-        
-        # 尝试做空信号 (down 或 range 方向)
-        if not detected and global_dir in ("down", "range"):
-            # L2
-            if c2["low"] < c1["low"] and c2["high"] <= c1["high"] and c2["close"] < c1["close"]:
-                detected = {"signal": "L2", "type": "short", "entry": c2["close"],
-                           "reason": f"连续两根降低: L2({c2['low']:.1f})<L1({c1['low']:.1f}), H2({c2['high']:.1f})≤H1({c1['high']:.1f}), Close({c2['close']:.1f})<前Close({c1['close']:.1f})"}
-            # L1
-            else:
-                body = c2["open"] - c2["close"]
-                rng = c2["high"] - c2["low"]
-                if body > 0 and rng > 0 and body / rng > 0.6 and c2["close"] < c1["low"]:
-                    detected = {"signal": "L1", "type": "short", "entry": c2["close"],
-                               "reason": f"强阴线吞没: 实体占比{body/rng*100:.0f}%, Close({c2['close']:.1f})<前Low({c1['low']:.1f})"}
-        
-        if not detected:
-            continue
-        
-        # 计算止损止盈
-        stop_dist = atr_5m * 1.6
-        if detected["type"] == "long":
-            stop = detected["entry"] - stop_dist
-            target = detected["entry"] + stop_dist * 1.5  # 震荡日 1.5R
-        else:
-            stop = detected["entry"] + stop_dist
-            target = detected["entry"] - stop_dist * 1.5
-        
-        # 追踪后续 bars 判断结果
-        result_status = "ongoing"
-        exit_price = None
-        exit_time = None
-        pnl_points = 0.0
-        bars_after = 0
-        
-        for j in range(i + 1, len(bars_5m)):
-            bars_after += 1
-            bar = bars_5m[j]
-            # 最多追踪 60 根 5min K线 (5小时)
-            if bars_after > 60:
+def find_key_levels(bars: List[Dict], lookback: int = 100, min_touch: int = 3) -> List[Dict]:
+    """找关键支撑压力位：接触次数多、同时充当过支撑和压力、画成区间"""
+    sh, sl = find_swing_highs_lows(bars[-lookback:], window=2)
+    all_swings = sh + sl
+    if len(all_swings) < 3:
+        return []
+    # 聚类：把价格相近的 swing 点合并
+    clusters = []
+    for s in all_swings:
+        placed = False
+        for c in clusters:
+            if abs(s["price"] - c["center"]) < 2.0:  # 2美元容差
+                c["points"].append(s)
+                c["center"] = sum(p["price"] for p in c["points"]) / len(c["points"])
+                placed = True
                 break
-            
-            if detected["type"] == "long":
-                # 止损优先
-                if bar["low"] <= stop:
-                    result_status = "loss"
-                    exit_price = stop
-                    exit_time = bar["dt"].strftime("%H:%M")
-                    pnl_points = stop - detected["entry"]
-                    break
-                if bar["high"] >= target:
-                    result_status = "win"
-                    exit_price = target
-                    exit_time = bar["dt"].strftime("%H:%M")
-                    pnl_points = target - detected["entry"]
-                    break
-            else:
-                if bar["high"] >= stop:
-                    result_status = "loss"
-                    exit_price = stop
-                    exit_time = bar["dt"].strftime("%H:%M")
-                    pnl_points = detected["entry"] - stop
-                    break
-                if bar["low"] <= target:
-                    result_status = "win"
-                    exit_price = target
-                    exit_time = bar["dt"].strftime("%H:%M")
-                    pnl_points = detected["entry"] - target
-                    break
-        
-        # 如果还没结束，用最后一根 bar 的 close 作为当前浮动盈亏
-        if result_status == "ongoing" and bars_after > 0:
-            last_bar = bars_5m[-1]
-            if detected["type"] == "long":
-                pnl_points = last_bar["close"] - detected["entry"]
-            else:
-                pnl_points = detected["entry"] - last_bar["close"]
-            exit_price = last_bar["close"]
-            exit_time = "--"
-        
-        signals.append({
-            "time": c2["dt"].strftime("%m-%d %H:%M"),
-            "ts": c2["ts"],
-            "signal": detected["signal"],
-            "type": detected["type"],
-            "reason": detected.get("reason", ""),
-            "global_dir": global_dir,
-            "entry": detected["entry"],
-            "stop": stop,
-            "target": target,
-            "result": result_status,
-            "exit": exit_price,
-            "exit_time": exit_time,
-            "pnl": pnl_points,
-            "bars_after": bars_after,
-        })
-    
-    # 去重: 同方向同类型 5 根 K线内只保留第一个
-    deduped = []
-    last_sig_key = None
-    last_sig_idx = -10
-    for i, s in enumerate(signals):
-        key = f"{s['type']}_{s['signal']}"
-        if key == last_sig_key and (i - last_sig_idx) < 5:
+        if not placed:
+            clusters.append({"center": s["price"], "points": [s]})
+    # 过滤：接触次数>=min_touch，且同时有 swing high 和 swing low（充当过支撑和压力）
+    levels = []
+    for c in clusters:
+        if len(c["points"]) < min_touch:
             continue
-        deduped.append(s)
-        last_sig_key = key
-        last_sig_idx = i
-    
-    # === 连亏反手模拟 (基于大盘方向确认) ===
-    # 规则: 同方向连亏3笔 → 检查当前信号的大盘方向(global_dir)是否已改变:
-    #   - 大盘方向已改变 → 跟随新方向 (标记为flipped)
-    #   - 大盘方向未改变 → 不反手, 继续原方向 (标记为pending)
-    # 反手后再亏2笔 → 当天停止交易
-    sim_consec_dir = None  # 当前连亏方向 (long/short)
-    sim_consec_count = 0
-    sim_flipped = False
-    sim_stopped = False
-    sim_stop_date = None
-    sim_pending = False  # 连亏3笔但大盘方向未改
-    
-    for s in deduped:
-        trade_date = s["time"][:5]  # MM-DD
-        
-        # 新的一天重置状态
-        if sim_stop_date and trade_date != sim_stop_date:
-            sim_stopped = False
-            sim_stop_date = None
-            sim_consec_dir = None
-            sim_consec_count = 0
-            sim_flipped = False
-            sim_pending = False
-        
-        if sim_stopped:
-            s["sim_action"] = "skipped_stopped"
-            s["sim_note"] = "当日已停止交易"
-            continue
-        
-        # 判断是否触发反手检查
-        should_flip = False
-        flip_blocked = False  # 连亏3笔但方向未改
-        
-        if sim_consec_count >= 3 and sim_consec_dir and not sim_flipped:
-            # 连亏3笔 → 检查大盘方向是否已改变
-            expected_flip_dir = "down" if sim_consec_dir == "long" else "up"
-            signal_market_dir = s.get("global_dir", "")  # up/down/range
-            if signal_market_dir == expected_flip_dir:
-                # 大盘方向已改变 → 反手
-                should_flip = True
-                sim_flipped = True
-                sim_consec_count = 0
-                sim_consec_dir = None
-                sim_pending = False
-            else:
-                # 大盘方向未改变 → 不反手, 标记 pending
-                flip_blocked = True
-                sim_pending = True
-        elif sim_consec_count >= 2 and sim_flipped:
-            # 反手后连亏2笔 → 停止
-            sim_stopped = True
-            sim_stop_date = trade_date
-            s["sim_action"] = "skipped_stopped"
-            s["sim_note"] = f"反手后连亏{sim_consec_count}笔→停止"
-            continue
-        
-        if should_flip:
-            s["sim_action"] = "flipped"
-            s["sim_note"] = f"连亏3笔+大盘方向已转→反手"
-        elif flip_blocked:
-            s["sim_action"] = "skipped_pending"
-            market_text = {'up': '↑', 'down': '↓', 'range': '→'}.get(s.get("global_dir", ""), s.get("global_dir", ""))
-            s["sim_note"] = f"连亏{sim_consec_count}笔, 大盘={market_text}未改→不开仓等待"
-            # pending 状态下不开仓, 但仍需追踪信号结果以判断连亏是否应该重置
-            # 如果信号结果为win, 说明方向对了, 重置连亏; 如果loss, 连亏继续累加
-            if s["result"] == "loss":
-                if sim_consec_dir == s["type"]:
-                    sim_consec_count += 1
-                else:
-                    sim_consec_dir = s["type"]
-                    sim_consec_count = 1
-            elif s["result"] == "win":
-                sim_consec_dir = None
-                sim_consec_count = 0
-                sim_pending = False
-            continue
-        else:
-            s["sim_action"] = "normal"
-            s["sim_note"] = ""
-        
-        # 更新连亏计数
-        if s["result"] == "loss":
-            if sim_consec_dir == s["type"]:
-                sim_consec_count += 1
-            else:
-                sim_consec_dir = s["type"]
-                sim_consec_count = 1
-        elif s["result"] == "win":
-            sim_consec_dir = None
-            sim_consec_count = 0
-            sim_pending = False
-        # ongoing 不影响连亏计数
-    
-    return deduped[-max_signals:]
-
-
-def key_levels(bars_5m: List[Dict[str, float]], bars_1h: List[Dict[str, float]]) -> Dict[str, Any]:
-    """找关键支撑/阻力位"""
-    # 取最近 1h 的 swing high/low 作为阻力/支撑
-    struct = detect_hh_hl(bars_1h)
-    resistance = max((s["price"] for s in struct.get("swing_highs", [])), default=None)
-    support = min((s["price"] for s in struct.get("swing_lows", [])), default=None)
-    # 5min 最近 20 根高低点
-    recent_5m = bars_5m[-20:] if len(bars_5m) >= 20 else bars_5m
-    r5m = max(b["high"] for b in recent_5m)
-    s5m = min(b["low"] for b in recent_5m)
-    return {
-        "resistance_1h": resistance,
-        "support_1h": support,
-        "resistance_5m": r5m,
-        "support_5m": s5m,
-        "detail": f"1H R={resistance:.1f} S={support:.1f} | 5M R={r5m:.1f} S={s5m:.1f}" if resistance and support else "关键位计算中"
-    }
-
-# ---------------- Rule Engine ----------------
-
-def now_sh() -> dt.datetime:
-    return dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
-
-def is_trading_window(cfg: Dict[str, Any]) -> Tuple[bool, str]:
-    now = now_sh()
-    start = dt.datetime.strptime(cfg["trading_window_start"], "%H:%M").time()
-    end = dt.datetime.strptime(cfg["trading_window_end"], "%H:%M").time()
-    t = now.time()
-    if start <= t <= end:
-        return True, f"交易时段内 ({now.strftime('%H:%M')} GMT+8)"
-    return False, f"不在交易时段 ({now.strftime('%H:%M')} GMT+8, 窗口 {cfg['trading_window_start']}-{cfg['trading_window_end']})"
-
-def is_news_blackout() -> Tuple[bool, str]:
-    """简化版：检查今日是否有重大数据（可手动维护日历或接入 API）。
-    这里先留接口，默认不屏蔽。"""
-    return False, "今日无已知重大数据发布（需手动维护经济日历）"
-
-def check_rules(cfg: Dict, bars_1h: List, bars_5m: List, manual_override: str = None) -> Dict[str, Any]:
-    now = now_sh()
-    checks = {}
-
-    # Rule 2: 交易时段
-    in_window, window_msg = is_trading_window(cfg)
-    checks["r2_trading_window"] = {"label": "R2 交易时段 (15:00-23:30 GMT+8)", "pass": in_window, "detail": window_msg}
-
-    # Rule 2b: 新闻屏蔽
-    news_block, news_msg = is_news_blackout()
-    checks["r2b_news"] = {"label": "R2b 新闻数据屏蔽期", "pass": not news_block, "detail": news_msg}
-
-    # Rule 2c: 23:30 后不持仓
-    after_close = now_sh().time() > dt.time(23, 30)
-    checks["r2c_after_hours"] = {"label": "R2c 23:30 后不入场", "pass": not after_close, "detail": "23:30 后不操作" if after_close else "在可操作时段内"}
-
-    # Rule 3: 1h 方向
-    struct_1h = detect_hh_hl(bars_1h)
-    direction = struct_1h["direction"]
-    dir_map = {"up": "只做多", "down": "只做空", "range": "震荡 - 方向不明"}
-    checks["r3_direction"] = {
-        "label": "R3 1h 方向 (HH/HL 结构)",
-        "pass": direction in ("up", "down"),
-        "detail": f"方向={dir_map.get(direction, direction)} | {', '.join(struct_1h.get('detail', []))}" if isinstance(struct_1h.get('detail'), list) else f"方向={dir_map.get(direction, direction)} | {struct_1h.get('detail','')}"
-    }
-
-    # Rule 4: 模式判断 (趋势日 / 震荡日)
-    # 三个子条件取交集，判断窗口 = 亚盘到欧盘早段 (UTC 00:00-07:30 = GMT+8 08:00-15:30)
-    #   4a 幅度够 (窗口内 ≥50 点) + 方向 (向上/向下/震荡)
-    #   4b 单向结构 (窗口内 HH/HL 向上 或 LL/LH 向下)
-    #   4c 突破亚盘区间 (向上突破 / 向下突破)
-    move = day_move_points(bars_1h)
-    asian = asian_session_range(bars_1h)
-
-    # R4b: 窗口内的单向结构检测
-    today = dt.datetime.utcnow().date()
-    window_bars_1h = [b for b in bars_1h if b["dt"].date() == today and b["dt"].hour <= 7]
-    if not window_bars_1h:
-        window_bars_1h = [b for b in bars_1h if b["dt"].date() == today]
-    struct_window = detect_hh_hl(window_bars_1h)
-    window_direction = struct_window["direction"]
-
-    # 4a 幅度+方向
-    amplitude_ok = move["points"] >= cfg["trend_day_min_points"]
-    move_dir = move.get("direction", "unknown")
-    amplitude_pass = amplitude_ok and move_dir in ("向上", "向下")
-    r4a_detail = f"幅度={move['points']:.0f}点 ({'>=50 ✓' if amplitude_ok else '<50 ✗'}) | 方向={move_dir} {'✓' if move_dir in ('向上','向下') else '✗'} | {move['detail']}"
-
-    # 4b 单向结构 (基于窗口内的 1h K线)
-    structure_type = "无"
-    if window_direction == "up":
-        structure_type = "HH/HL (向上)"
-    elif window_direction == "down":
-        structure_type = "LL/LH (向下)"
-    else:
-        structure_type = "无明显单向结构"
-    structure_ok = window_direction in ("up", "down")
-    struct_detail_parts = struct_window.get("detail", "")
-    if isinstance(struct_detail_parts, list):
-        struct_detail_str = ", ".join(struct_detail_parts)
-    else:
-        struct_detail_str = struct_detail_parts
-    r4b_detail = f"结构={structure_type} {'✓' if structure_ok else '✗'} | {struct_detail_str}"
-
-    # 4c 突破亚盘区间 — 用 R4a 窗口 H/L 作为区间基准，最新实时价判断是否突破
-    # 逻辑:
-    #   - 区间上沿 = move["high"] (R4a 窗口内最高)
-    #   - 区间下沿 = move["low"]  (R4a 窗口内最低)
-    #   - 当前价 > 上沿 → 向上突破
-    #   - 当前价 < 下沿 → 向下突破
-    #   - 突破后回到中间 / 从未突破 → 震荡
-    breakout_dir = "无"
-    breakout_ok = False
-    current_price = bars_5m[-1]["close"] if bars_5m else (bars_1h[-1]["close"] if bars_1h else None)
-    range_high = move.get("high")
-    range_low = move.get("low")
-    if range_high and range_low and current_price:
-        if current_price > range_high:
-            breakout_dir = "向上突破"
-            breakout_ok = True
-        elif current_price < range_low:
-            breakout_dir = "向下突破"
-            breakout_ok = True
-        else:
-            # 在区间内 — 检查是否曾经突破过又回到中间
-            # 用5m K线检查窗口后的最高/最低是否突破过区间
-            today_utc = dt.datetime.utcnow().date()
-            post_window_bars = [b for b in bars_5m if b["dt"].date() == today_utc and b["dt"].hour >= 7]
-            if post_window_bars:
-                post_high = max(b["high"] for b in post_window_bars)
-                post_low = min(b["low"] for b in post_window_bars)
-                broke_up = post_high > range_high
-                broke_down = post_low < range_low
-                if broke_up and not broke_down:
-                    breakout_dir = "曾向上突破后回落 (震荡)"
-                elif broke_down and not broke_up:
-                    breakout_dir = "曾向下突破后回升 (震荡)"
-                elif broke_up and broke_down:
-                    breakout_dir = "双向突破后回归 (宽幅震荡)"
-                else:
-                    breakout_dir = "未突破 (震荡)"
-            else:
-                breakout_dir = "区间内 (震荡)"
-            breakout_ok = False
-    r4c_detail = f"突破={breakout_dir} {'✓' if breakout_ok else '✗'} | 区间 H={range_high:.1f} L={range_low:.1f} | 当前价={current_price:.1f}"
-
-    # 三者交集
-    is_trend_day = amplitude_pass and structure_ok and breakout_ok
-    day_mode = "趋势日" if is_trend_day else "震荡日"
-
-    # 趋势方向一致性检查（幅度方向、结构方向、突破方向是否一致）
-    trend_dir = "unknown"
-    if is_trend_day:
-        dirs = []
-        if move_dir in ("向上", "向下"):
-            dirs.append(move_dir)
-        if window_direction == "up":
-            dirs.append("向上")
-        elif window_direction == "down":
-            dirs.append("向下")
-        if breakout_dir == "向上突破":
-            dirs.append("向上")
-        elif breakout_dir == "向下突破":
-            dirs.append("向下")
-        if len(set(dirs)) == 1 and len(dirs) == 3:
-            trend_dir = dirs[0]
-        else:
-            trend_dir = "不一致"
-            is_trend_day = False
-            day_mode = "震荡日 (三因素方向不一致)"
-
-    checks["r4a_amplitude"] = {
-        "label": "R4a 幅度够 + 方向 (亚盘→欧盘早段 ≥50点, 向上/向下)",
-        "pass": amplitude_pass,
-        "detail": r4a_detail
-    }
-    checks["r4b_structure"] = {
-        "label": "R4b 单向结构 (窗口内 HH/HL 向上 或 LL/LH 向下)",
-        "pass": structure_ok,
-        "detail": r4b_detail
-    }
-    checks["r4c_breakout"] = {
-        "label": "R4c 突破亚盘区间 (窗口内向上/向下突破)",
-        "pass": breakout_ok,
-        "detail": r4c_detail
-    }
-    checks["r4_day_mode"] = {
-        "label": f"R4 当日模式 = {day_mode}" + (f" (方向: {trend_dir})" if is_trend_day else ""),
-        "pass": True,  # 模式本身不是 pass/fail，只是分类
-        "detail": f"三条件交集: {'全部满足 → 趋势日' if is_trend_day else '至少一项不满足 → 震荡日'} | 幅度方向={move_dir} | 结构={structure_type} | 突破={breakout_dir}" + (f" | 趋势方向一致={trend_dir}" if is_trend_day else ""),
-        "is_trend_day": is_trend_day,
-        "trend_dir": trend_dir if is_trend_day else None
-    }
-
-    # === 加载状态 (提前到 R5 之前，因为 R5 需要连亏状态) ===
-    state = load_state()
-    today_str = now.strftime("%Y-%m-%d")
-    if state.get("trade_date") != today_str:
-        state["trade_date"] = today_str
-        state["signals_today"] = []
-        state["daily_loss_R"] = 0.0
-        state["consecutive_loss_dir"] = None
-        state["consecutive_loss_count"] = 0
-        state["flipped_today"] = False
-        state["stopped_today"] = False
-        state["pending_flip_check"] = False
-
-    # Rule 5: 入场信号
-    # 趋势日用 R4 的 trend_dir (三因素一致方向)，震荡日用 R3 的 direction
-    effective_dir = trend_dir if (is_trend_day and trend_dir in ("向上", "向下")) else direction
-    effective_dir_en = "up" if effective_dir == "向上" else "down" if effective_dir == "向下" else effective_dir
-    atr_5m = atr(bars_5m, cfg["atr_period"])
-    
-    # === 连续亏损反手机制 (基于大盘方向确认) ===
-    # 规则: 同方向连亏3笔 → 检查1H大盘方向是否已改变:
-    #   - 大盘方向已改变 → 跟随新方向做单 (反手)
-    #   - 大盘方向未改变 → 不反手, 保持原方向 (但记录待反手状态)
-    # 反手后再亏2笔 → 当天停止交易
-    consec_loss_dir = state.get("consecutive_loss_dir")  # long / short
-    consec_loss_count = state.get("consecutive_loss_count", 0)
-    flipped_today = state.get("flipped_today", False)
-    stopped_today = state.get("stopped_today", False)
-    pending_flip_check = state.get("pending_flip_check", False)  # 连亏3笔但方向未改, 待确认
-    
-    direction_override = None
-    direction_override_reason = ""
-    
-    # 将连亏方向转为 en: long→做多的亏损方向是 long, 反手目标取决于大盘方向
-    loss_dir_en = "up" if consec_loss_dir == "long" else "down" if consec_loss_dir == "short" else None
-    # 大盘当前方向
-    market_dir = direction  # R3 的 1H 方向: up/down/range
-    
-    if stopped_today:
-        direction_override = "none"
-        direction_override_reason = f"今日已停止交易 (反手后又连亏2笔)，等待用户指令恢复"
-    elif consec_loss_count >= 3 and consec_loss_dir and not flipped_today:
-        # 同方向连亏3笔 → 检查大盘方向是否已改变
-        expected_flip_dir = "down" if consec_loss_dir == "long" else "up"  # 期望的反手方向
-        if market_dir == expected_flip_dir:
-            # 大盘方向已改变 → 跟随新方向反手
-            direction_override = expected_flip_dir
-            direction_override_reason = f"{consec_loss_dir}方向连亏{consec_loss_count}笔 + 大盘1H方向已转为{'向上' if expected_flip_dir == 'up' else '向下'} → 反手为{expected_flip_dir}方向"
-            state["flipped_today"] = True
-            state["pending_flip_check"] = False
-        else:
-            # 大盘方向未改变 → 不开仓, 等待大盘方向改变
-            state["pending_flip_check"] = True
-            market_dir_text = {'up': '向上', 'down': '向下', 'range': '震荡'}.get(market_dir, market_dir)
-            direction_override = "none"
-            direction_override_reason = f"{consec_loss_dir}方向连亏{consec_loss_count}笔, 大盘1H方向={market_dir_text}未改变 → 不开仓, 等待大盘方向确认"
-    elif flipped_today and consec_loss_count >= 2:
-        # 反手后又亏2笔 → 停止
-        direction_override = "none"
-        direction_override_reason = f"反手后{consec_loss_dir}方向再连亏{consec_loss_count}笔 → 今日停止交易"
-        stopped_today = True
-        state["stopped_today"] = True
-    
-    # === 手动覆盖 (最高优先级) ===
-    if manual_override in ('long', 'short', 'resume'):
-        if manual_override == 'resume':
-            # 恢复自动交易: 清除停止/翻转状态
-            stopped_today = False
-            flipped_today = False
-            consec_loss_count = 0
-            consec_loss_dir = None
-            pending_flip_check = False
-            state["stopped_today"] = False
-            state["flipped_today"] = False
-            state["consecutive_loss_count"] = 0
-            state["consecutive_loss_dir"] = None
-            state["pending_flip_check"] = False
-            direction_override = None
-            direction_override_reason = "手动恢复自动交易"
-        elif manual_override in ('long', 'short'):
-            # 强制方向: 覆盖一切
-            forced_dir = 'up' if manual_override == 'long' else 'down'
-            direction_override = forced_dir
-            direction_override_reason = f"手动覆盖: 强制{'做多' if manual_override == 'long' else '做空'}"
-            stopped_today = False
-            state["stopped_today"] = False
-    
-    # 应用方向覆盖
-    if direction_override == "none":
-        effective_dir_en = "none"
-        sig = {"signal": "none", "type": None, "detail": direction_override_reason}
-        signal_ok = False
-        sig_label = "停止交易"
-    elif direction_override:
-        effective_dir_en = direction_override
-        sig = detect_5min_signal(bars_5m, effective_dir_en, atr_5m)
-        if is_trend_day:
-            needed = ["H2"] if effective_dir_en == "up" else ["L2"]
-        else:
-            needed = ["H1"] if effective_dir_en in ("up", "range") else ["L1"]
-        signal_ok = sig["signal"] in needed
-        sig_label = f"反手{'做多' if effective_dir_en == 'up' else '做空'} (大盘方向确认) | " + ("趋势日" if is_trend_day else "震荡日")
-    else:
-        sig = detect_5min_signal(bars_5m, effective_dir_en, atr_5m)
-        if is_trend_day:
-            needed = ["H2"] if effective_dir_en == "up" else ["L2"]
-        else:
-            needed = ["H1"] if effective_dir_en in ("up", "range") else ["L1"]
-        signal_ok = sig["signal"] in needed
-        sig_label = "趋势日需 H2/L2" if is_trend_day else "震荡日需 H1/L1"
-    
-    levels = key_levels(bars_5m, bars_1h)
-    
-    checks["r5_entry_signal"] = {
-        "label": f"R5 入场信号 ({sig_label})",
-        "pass": signal_ok,
-        "detail": f"{sig['detail']} | 关键位: {levels['detail']}" + (f" | ⚠ {direction_override_reason}" if direction_override_reason else "")
-    }
-
-    # Rule 6: 止损
-    # 止损距离: 取 1.6*ATR 和 结构低/高点距离 两者中更宽的
-    # 方向用 effective_dir_en (R4趋势方向 或 R3方向)
-    entry_now = bars_5m[-1]["close"] if bars_5m else 0
-    stop_atr_dist = atr_5m * cfg["atr_multiplier_stop"] if atr_5m > 0 else 0  # 距离值
-    stop_struct_price = None  # 绝对价格
-    stop_struct_dist = 0  # 距离值
-    if effective_dir_en == "up" and struct_1h.get("swing_lows"):
-        stop_struct_price = struct_1h["swing_lows"][-1]["price"] - 1
-        stop_struct_dist = max(0, entry_now - stop_struct_price)
-    elif effective_dir_en == "down" and struct_1h.get("swing_highs"):
-        stop_struct_price = struct_1h["swing_highs"][-1]["price"] + 1
-        stop_struct_dist = max(0, stop_struct_price - entry_now)
-    # 取更宽者作为止损距离
-    stop_dist = max(stop_atr_dist, stop_struct_dist) if (stop_atr_dist and stop_struct_dist) else (stop_atr_dist or stop_struct_dist or 0)
-    # 计算止损绝对价格
-    if effective_dir_en == "up":
-        stop_price_calc = entry_now - stop_dist if stop_dist else None
-    elif effective_dir_en == "down":
-        stop_price_calc = entry_now + stop_dist if stop_dist else None
-    else:
-        stop_price_calc = None
-    stop_price_calc_str = f"{stop_price_calc:.2f}" if stop_price_calc else "N/A"
-    checks["r6_stop_loss"] = {
-        "label": "R6 止损 (1.6×ATR 或结构高低点取宽者)",
-        "pass": stop_dist > 0,
-        "detail": f"ATR(5m,14)={atr_5m:.2f} → 1.6×ATR={stop_atr_dist:.2f}点 | 结构止损位={stop_struct_price} (距离={stop_struct_dist:.2f}) | 取宽者: 距离={stop_dist:.2f} → 止损价={stop_price_calc_str}"
-    }
-
-    # Rule 7: 止盈
-    if is_trend_day:
-        target_min = cfg["trend_target_R_min"]
-        target_max = cfg["trend_target_R_max"]
-    else:
-        target_min = cfg["range_target_R_min"]
-        target_max = cfg["range_target_R_max"]
-    checks["r7_take_profit"] = {
-        "label": f"R7 止盈目标 ({'趋势' if is_trend_day else '震荡'} {target_min}R-{target_max}R)",
-        "pass": True,
-        "detail": f"目标 {target_min}R-{target_max}R | 到 1R 后改 ATR 移动止损跟踪"
-    }
-
-    # Rule 8: 资金风控
-    daily_loss = state.get("daily_loss_R", 0.0)
-    trades_today = len(state.get("signals_today", []))
-    stopped_today = state.get("stopped_today", False)
-    consec_loss_dir = state.get("consecutive_loss_dir")
-    consec_loss_count = state.get("consecutive_loss_count", 0)
-    flipped_today = state.get("flipped_today", False)
-    
-    risk_ok = (not stopped_today) and daily_loss < cfg["daily_max_loss_R"] and trades_today < cfg["max_trades_per_day"]
-    
-    consec_detail = ""
-    if stopped_today:
-        consec_detail = " | ⚠ 今日已停止交易 (反手后又亏2笔)"
-    elif flipped_today and consec_loss_count > 0:
-        consec_detail = f" | ⚠ 已反手, 反手后{consec_loss_dir}方向连亏{consec_loss_count}笔"
-    elif consec_loss_count >= 3 and state.get("pending_flip_check"):
-        market_dir_text = {'up': '↑', 'down': '↓', 'range': '→'}.get(direction, direction)
-        consec_detail = f" | ⚠ {consec_loss_dir}连亏{consec_loss_count}笔, 待大盘方向确认 (当前{market_dir_text})"
-    elif consec_loss_count >= 3:
-        consec_detail = f" | ⚠ {consec_loss_dir}方向连亏{consec_loss_count}笔, 触发反手检查"
-    elif consec_loss_count > 0:
-        consec_detail = f" | {consec_loss_dir}方向连亏{consec_loss_count}笔"
-    
-    checks["r8_risk"] = {
-        "label": f"R8 当日风控 (已亏 {daily_loss:.2f}R / 上限 {cfg['daily_max_loss_R']}R, 已交易 {trades_today}/{cfg['max_trades_per_day']} 笔){consec_detail}",
-        "pass": risk_ok,
-        "detail": f"{'风控未打满, 可继续' if risk_ok else '风控已打满或已停止, 停止交易'}"
-    }
-
-    # Rule 9: re-entry (美盘不开新仓)
-    us_session = now_sh().time() >= dt.time(21, 30)  # 美盘开盘约 21:30 GMT+8
-    if us_session and not state.get("signals_today"):
-        reentry_ok = False
-        reentry_msg = "美盘时段且无持仓 - 不开新仓 (期望值为负)"
-    elif us_session and state.get("signals_today"):
-        reentry_ok = True
-        reentry_msg = "美盘时段但有持仓 - 用美盘行情打止盈或反方向离场"
-    else:
-        reentry_ok = True
-        reentry_msg = "非美盘时段 - re-entry 限制不适用"
-    checks["r9_reentry"] = {
-        "label": "R9 美盘 re-entry 限制",
-        "pass": reentry_ok,
-        "detail": reentry_msg
-    }
-
-    # 综合判断
-    gating_keys = ["r2_trading_window", "r2b_news", "r2c_after_hours", "r3_direction", "r5_entry_signal", "r8_risk", "r9_reentry"]
-    all_pass = all(checks[k]["pass"] for k in gating_keys)
-
-    # 计算入场价与止损止盈
-    entry_price = bars_5m[-1]["close"] if bars_5m else None
-    stop_price = stop_price_calc
-    r_dist = stop_dist
-    if effective_dir_en == "up" and r_dist > 0 and entry_price:
-        target_price = entry_price + r_dist * target_max
-    elif effective_dir_en == "down" and r_dist > 0 and entry_price:
-        target_price = entry_price - r_dist * target_max
-    else:
-        target_price = None
-
-    return {
-        "checks": checks,
-        "all_pass": all_pass,
-        "direction": direction,
-        "effective_dir": effective_dir_en,
-        "trend_dir": trend_dir if is_trend_day else None,
-        "day_mode": day_mode,
-        "is_trend_day": is_trend_day,
-        "signal": sig,
-        "levels": levels,
-        "atr_5m": atr_5m,
-        "stop_distance": stop_dist,
-        "entry_price": entry_price,
-        "stop_price": stop_price,
-        "target_price": target_price,
-        "target_R": f"{target_min}R-{target_max}R",
-        "now": now.strftime("%Y-%m-%d %H:%M:%S GMT+8"),
-        "state": state,
-    }
-
-# ---------------- HTML Report (Bloomberg Terminal Style) ----------------
-
-def generate_html(result: Dict[str, Any], bars_1h, bars_5m, signal_history=None) -> str:
-    checks = result["checks"]
-    last_price = bars_5m[-1]["close"] if bars_5m else 0
-    prev_price = bars_5m[-2]["close"] if len(bars_5m) >= 2 else last_price
-    chg = last_price - prev_price
-    chg_pct = (chg / prev_price * 100) if prev_price else 0
-    up_color = "#00e676"
-    down_color = "#ff5252"
-    warn_color = "#ffab40"
-    dim_color = "#666"
-
-    # 分组规则
-    groups = {
-        "时段": ["r2_trading_window", "r2b_news", "r2c_after_hours"],
-        "方向": ["r3_direction"],
-        "模式": ["r4a_amplitude", "r4b_structure", "r4c_breakout", "r4_day_mode"],
-        "信号": ["r5_entry_signal", "r6_stop_loss", "r7_take_profit"],
-        "风控": ["r8_risk", "r9_reentry"],
-    }
-
-    # 统计通过/失败
-    failed_keys = [k for k, v in checks.items() if not v["pass"]]
-    failed_count = len(failed_keys)
-    total_count = len(checks)
-    pass_count = total_count - failed_count
-
-    # 决策信号灯
-    eff_dir = result.get("effective_dir", result["direction"])
-    is_trend = result.get("is_trend_day", False)
-    day_mode = result["day_mode"]
-    signal_name = result["signal"]["signal"]
-
-    if result["all_pass"]:
-        verdict_color = up_color
-        verdict_bg = "rgba(0,230,118,0.08)"
-        verdict_text = f"▶ EXECUTE {'LONG' if eff_dir == 'up' else 'SHORT'}"
-        verdict_sub = f"{signal_name} | {day_mode} | {'趋势方向 ' + result.get('trend_dir','')}" if is_trend else f"{signal_name} | {day_mode}"
-    elif pass_count > 0:
-        verdict_color = warn_color
-        verdict_bg = "rgba(255,171,64,0.08)"
-        verdict_text = f"◷ WAITING ({failed_count} 条件未满足)"
-        verdict_sub = ", ".join(failed_keys[:4])
-    else:
-        verdict_color = down_color
-        verdict_bg = "rgba(255,82,82,0.08)"
-        verdict_text = "✕ NO TRADE"
-        verdict_sub = "核心条件不满足"
-
-    # 方向标签
-    dir_color = up_color if eff_dir == "up" else down_color if eff_dir == "down" else dim_color
-    dir_text = {"up": "LONG ↑", "down": "SHORT ↓", "range": "NEUTRAL ◇"}.get(eff_dir, "--")
-
-    # 交易计划
-    entry = result.get("entry_price")
-    stop = result.get("stop_price")
-    target = result.get("target_price")
-    stop_dist = result.get("stop_distance", 0)
-    entry_str = f"{entry:.2f}" if entry else "--"
-    stop_str = f"{stop:.2f}" if stop else "--"
-    target_str = f"{target:.2f}" if target else "--"
-
-    # RR 计算
-    if entry and stop and target and stop_dist > 0:
-        target_dist = abs(target - entry)
-        rr_ratio = target_dist / stop_dist if stop_dist > 0 else 0
-        rr_str = f"{rr_ratio:.1f}R"
-    else:
-        rr_str = "--"
-
-    # 1h 方向结构
-    r3 = checks.get("r3_direction", {})
-    r3_detail = r3.get("detail", "")
-    r3_pass = r3.get("pass", False)
-
-    # R4 三条件可视化
-    r4a = checks.get("r4a_amplitude", {})
-    r4b = checks.get("r4b_structure", {})
-    r4c = checks.get("r4c_breakout", {})
-    r4a_pass = r4a.get("pass", False)
-    r4b_pass = r4b.get("pass", False)
-    r4c_pass = r4c.get("pass", False)
-    r4 = checks.get("r4_day_mode", {})
-    is_trend_day = r4.get("is_trend_day", False)
-
-    # 从 detail 提取信息
-    move = result.get("_move", {})
-    
-    # 风控状态
-    r8 = checks.get("r8_risk", {})
-    r9 = checks.get("r9_reentry", {})
-    state = result.get("state", {})
-    daily_loss = state.get("daily_loss_R", 0)
-    trades_today = len(state.get("signals_today", []))
-
-    # 构建分组表格
-    group_labels = {
-        "时段": ("⏰", "SESSION"),
-        "方向": ("🎯", "DIRECTION"),
-        "模式": ("📊", "DAY MODE"),
-        "信号": ("⚡", "SIGNAL"),
-        "风控": ("🛡", "RISK"),
-    }
-
-    group_html_parts = []
-    for gkey, keys in groups.items():
-        icon, label = group_labels[gkey]
-        g_passed = sum(1 for k in keys if checks.get(k, {}).get("pass", False))
-        g_total = len(keys)
-        g_color = up_color if g_passed == g_total else (warn_color if g_passed > 0 else down_color)
-        
-        rows_html = ""
-        for k in keys:
-            v = checks.get(k, {})
-            if not v:
-                continue
-            status_icon = "✅" if v["pass"] else "❌"
-            row_opacity = "" if not v["pass"] else ""
-            # R4 总结行特殊处理
-            if k == "r4_day_mode":
-                if is_trend_day:
-                    mode_badge = f"<span style='color:{up_color};font-weight:700'>趋势日</span>"
-                else:
-                    mode_badge = f"<span style='color:{warn_color};font-weight:700'>震荡日</span>"
-                rows_html += f"""
-                <tr class="summary-row">
-                    <td colspan="3" style="padding:8px 12px;border-top:1px solid #2a2a2a">
-                        <span style="color:{g_color}">{status_icon}</span>
-                        <span style="color:#aaa;margin-left:6px">当日模式:</span>
-                        {mode_badge}
-                        <span style="color:#666;margin-left:8px;font-size:11px">{v['detail']}</span>
-                    </td>
-                </tr>"""
-                continue
-            
-            detail_short = v["detail"]
-            # 截断过长的 detail
-            if len(detail_short) > 200:
-                detail_short = detail_short[:200] + "..."
-            
-            rows_html += f"""
-            <tr>
-                <td class="rule-label">{status_icon} {v['label']}</td>
-                <td class="rule-detail">{detail_short}</td>
-            </tr>"""
-        
-        group_html_parts.append(f"""
-        <div class="rule-group">
-            <div class="group-header" style="border-left:3px solid {g_color}">
-                <span class="group-icon">{icon}</span>
-                <span class="group-title">{label}</span>
-                <span class="group-count" style="color:{g_color}">{g_passed}/{g_total}</span>
-            </div>
-            <table class="rule-table">
-                {rows_html}
-            </table>
-        </div>""")
-
-    groups_html = "\n".join(group_html_parts)
-
-    # R4 三条件交集可视化
-    r4_cells = []
-    for label, passed, detail in [
-        ("幅度≥50点", r4a_pass, r4a.get("detail", "")),
-        ("单向结构", r4b_pass, r4b.get("detail", "")),
-        ("突破亚盘", r4c_pass, r4c.get("detail", "")),
-    ]:
-        cell_color = up_color if passed else down_color
-        bg = f"rgba(0,230,118,0.06)" if passed else "rgba(255,82,82,0.06)"
-        icon = "✓" if passed else "✗"
-        # 提取关键信息
-        short = detail.split("|")[0].strip() if detail else ""
-        r4_cells.append(f"""
-        <div class="r4-cell" style="border-color:{cell_color};background:{bg}">
-            <div class="r4-icon" style="color:{cell_color}">{icon}</div>
-            <div class="r4-label">{label}</div>
-            <div class="r4-info">{short}</div>
-        </div>""")
-    r4_cells_html = "\n".join(r4_cells)
-    r4_result_color = up_color if is_trend_day else warn_color
-    r4_result_text = "趋势日 TREND DAY" if is_trend_day else "震荡日 RANGE DAY"
-
-    # === 准备 TradingView Lightweight Charts 数据 ===
-    # 5min K线数据 (全部)
-    chart_bars_5m = []
-    for b in bars_5m:
-        chart_bars_5m.append({
-            "time": b["ts"],
-            "open": round(b["open"], 2),
-            "high": round(b["high"], 2),
-            "low": round(b["low"], 2),
-            "close": round(b["close"], 2),
-        })
-    
-    # 1H K线数据 (全部)
-    chart_bars_1h = []
-    for b in bars_1h:
-        chart_bars_1h.append({
-            "time": b["ts"],
-            "open": round(b["open"], 2),
-            "high": round(b["high"], 2),
-            "low": round(b["low"], 2),
-            "close": round(b["close"], 2),
-        })
-    
-    # 信号 markers
-    chart_markers = []
-    if signal_history:
-        for s in signal_history:
-            is_long = s["type"] == "long"
-            color = up_color if is_long else down_color
-            arrow = "arrowUp" if is_long else "arrowDown"
-            position = "belowBar" if is_long else "aboveBar"
-            result_icon = "✓" if s["result"] == "win" else ("✗" if s["result"] == "loss" else "…")
-            label = f"{s['signal']} {result_icon}"
-            chart_markers.append({
-                "time": s["ts"],
-                "position": position,
-                "color": color,
-                "shape": arrow,
-                "text": label,
-                "entry": s["entry"],
-                "result": s["result"],
-                "pnl": round(s["pnl"], 2),
+        has_high = any(p in sh for p in c["points"])
+        has_low = any(p in sl for p in c["points"])
+        if has_high and has_low:
+            prices = [p["price"] for p in c["points"]]
+            levels.append({
+                "center": c["center"],
+                "upper": max(prices),
+                "lower": min(prices),
+                "touches": len(c["points"]),
+                "has_support": has_low,
+                "has_resistance": has_high,
             })
-    
-    # 信号历史表
-    sig_history_json = json.dumps(signal_history or [], ensure_ascii=False)
-    chart_bars_5m_json = json.dumps(chart_bars_5m)
-    chart_bars_1h_json = json.dumps(chart_bars_1h)
-    chart_markers_json = json.dumps(chart_markers)
-    
-    # 统计胜率
-    if signal_history:
-        completed = [s for s in signal_history if s["result"] in ("win", "loss")]
-        wins = sum(1 for s in completed if s["result"] == "win")
-        losses = len(completed) - wins
-        winrate = (wins / len(completed) * 100) if completed else 0
-        total_pnl = sum(s["pnl"] for s in completed)
-        stats_text = f"{wins}W / {losses}L | 胜率 {winrate:.0f}% | 总盈亏 {total_pnl:+.1f}点 | {len(signal_history)} 信号"
+    levels.sort(key=lambda x: x["touches"], reverse=True)
+    return levels[:8]
+
+def find_fvg(bars: List[Dict]) -> List[Dict]:
+    """检测 Fair Value Gap (FVG) — 三根K线中第一根high和第三根low之间的缺口（看涨FVG）
+    或第一根low和第三根high之间的缺口（看跌FVG）"""
+    fvgs = []
+    for i in range(len(bars) - 2):
+        b0, b1, b2 = bars[i], bars[i+1], bars[i+2]
+        # 看涨FVG: b0.high < b2.low
+        if b0["high"] < b2["low"]:
+            fvgs.append({"type": "bullish", "index": i+1, "upper": b2["low"], "lower": b0["high"], "dt": b1["dt"]})
+        # 看跌FVG: b0.low > b2.high
+        elif b0["low"] > b2["high"]:
+            fvgs.append({"type": "bearish", "index": i+1, "upper": b0["low"], "lower": b2["high"], "dt": b1["dt"]})
+    return fvgs
+
+def detect_sb_structure(bars: List[Dict], direction: str, lookback: int = 20) -> Optional[Dict]:
+    """检测 SB 结构（两次逆势突破失败）
+    direction='up' 做多：寻找下跌趋势后两次向下突破失败
+    direction='down' 做空：寻找上涨趋势后两次向上突破失败
+    """
+    if len(bars) < 10:
+        return None
+    recent = bars[-lookback:] if len(bars) >= lookback else bars
+    if len(recent) < 10:
+        return None
+
+    if direction == "up":
+        # 找做空机会的反面：下跌趋势后两次向下突破失败
+        # 突破失败 = K线 low 突破前低后收盘回到前低之上
+        swings = find_swing_highs_lows(recent, window=1)
+        lows = swings[1]  # swing lows
+        if len(lows) < 2:
+            return None
+        # 两次向下突破失败
+        failures = 0
+        for j in range(len(lows) - 1):
+            level = lows[j]["price"]
+            next_bar = recent[lows[j+1]["i"]] if lows[j+1]["i"] < len(recent) else None
+            if next_bar and next_bar["low"] < level and next_bar["close"] > level:
+                failures += 1
+        if failures >= 2:
+            last_bar = recent[-1]
+            return {
+                "type": "SB_bullish",
+                "signal_bar": last_bar,
+                "entry": last_bar["close"],
+                "stop": last_bar["low"],
+                "detail": f"两次向下突破失败({failures}次) | 入场={last_bar['close']:.2f} 止损={last_bar['low']:.2f}",
+            }
+    elif direction == "down":
+        swings = find_swing_highs_lows(recent, window=1)
+        highs = swings[0]
+        if len(highs) < 2:
+            return None
+        failures = 0
+        for j in range(len(highs) - 1):
+            level = highs[j]["price"]
+            next_bar = recent[highs[j+1]["i"]] if highs[j+1]["i"] < len(recent) else None
+            if next_bar and next_bar["high"] > level and next_bar["close"] < level:
+                failures += 1
+        if failures >= 2:
+            last_bar = recent[-1]
+            return {
+                "type": "SB_bearish",
+                "signal_bar": last_bar,
+                "entry": last_bar["close"],
+                "stop": last_bar["high"],
+                "detail": f"两次向上突破失败({failures}次) | 入场={last_bar['close']:.2f} 止损={last_bar['high']:.2f}",
+            }
+    return None
+
+def is_doji(bar: Dict, body_threshold: float = 0.15) -> bool:
+    """十字星：实体长度 < 全振幅的 15%"""
+    body = abs(bar["close"] - bar["open"])
+    full = bar["high"] - bar["low"]
+    if full <= 0:
+        return False
+    return body / full < body_threshold
+
+def find_trend_segment(bars: List[Dict], min_bars: int = 10) -> Optional[Dict]:
+    """找到最近一段明确的趋势（用于DD结构）"""
+    if len(bars) < min_bars:
+        return None
+    # 用最近 30 根找趋势
+    recent = bars[-30:] if len(bars) >= 30 else bars
+    ema21_l = ema_of_bars(recent, "close", 21)
+    if ema21_l[-1] is None:
+        return None
+    # 判断方向
+    start_price = recent[0]["close"]
+    end_price = recent[-1]["close"]
+    if end_price > start_price:
+        direction = "up"
+    elif end_price < start_price:
+        direction = "down"
     else:
-        stats_text = "暂无历史信号"
+        return None
+    # 找趋势的起点和终点
+    if direction == "up":
+        low_idx = min(range(len(recent)), key=lambda i: recent[i]["low"])
+        high_idx = max(range(len(recent)), key=lambda i: recent[i]["high"])
+        trend_start = recent[low_idx]
+        trend_end = recent[high_idx] if high_idx > low_idx else recent[-1]
+    else:
+        high_idx = max(range(len(recent)), key=lambda i: recent[i]["high"])
+        low_idx = min(range(len(recent)), key=lambda i: recent[i]["low"])
+        trend_start = recent[high_idx]
+        trend_end = recent[low_idx] if low_idx > high_idx else recent[-1]
+    return {
+        "direction": direction,
+        "start": trend_start,
+        "end": trend_end,
+        "start_price": trend_start["low"] if direction == "up" else trend_start["high"],
+        "end_price": trend_end["high"] if direction == "up" else trend_end["low"],
+    }
 
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="refresh" content="300">
-<title>XAU/USD Trading Terminal</title>
-<style>
+def fibonacci_retracement(start_price: float, end_price: float) -> Dict[str, float]:
+    """计算斐波那契回调位"""
+    diff = end_price - start_price
+    return {
+        "0%": end_price,
+        "23.6%": end_price - 0.236 * diff,
+        "38.2%": end_price - 0.382 * diff,
+        "50%": end_price - 0.5 * diff,
+        "61.8%": end_price - 0.618 * diff,
+        "78.6%": end_price - 0.786 * diff,
+        "100%": start_price,
+    }
+
+def detect_dd_structure(bars: List[Dict], trend: Dict, ema20: List) -> Optional[Dict]:
+    """检测 DD 结构（趋势 + 61.8%回调 + 双十字星）
+    必要条件：
+    1. 必须有一段明确的趋势
+    2. 回调不能跌破整段趋势的61.8%
+    3. 两个十字星越靠近EMA20越好
+    4. 越靠近极值点越好
+    5. 回调必须是简单回调
+    """
+    if not trend or len(bars) < 15:
+        return None
+    fib = fibonacci_retracement(trend["start_price"], trend["end_price"])
+    fib_618 = fib["61.8%"]
+    direction = trend["direction"]
+    recent = bars[-15:]
+    # 检查回调是否超过61.8%
+    if direction == "up":
+        # 做多：回调最低点不应跌破61.8%
+        min_low = min(b["low"] for b in recent)
+        if min_low < fib_618:
+            return None
+    else:
+        # 做空：回调最高点不应超过61.8%
+        max_high = max(b["high"] for b in recent)
+        if max_high > fib_618:
+            return None
+    # 找最近两根十字星
+    dojis = [b for b in recent[-6:] if is_doji(b)]
+    if len(dojis) < 2:
+        return None
+    # 取最近两根十字星
+    d1, d2 = dojis[-2], dojis[-1]
+    # 检查是否靠近 EMA20
+    ema20_val = ema20[-1] if ema20 and ema20[-1] is not None else None
+    ema_dist = 0
+    if ema20_val:
+        mid_doji = (d1["close"] + d2["close"]) / 2
+        ema_dist = abs(mid_doji - ema20_val)
+    # 止损放在信号K线底部/顶部
+    if direction == "up":
+        stop = min(d1["low"], d2["low"])
+        entry = d2["close"]
+        target = entry + (entry - stop) * 2  # 1:2 盈亏比
+    else:
+        stop = max(d1["high"], d2["high"])
+        entry = d2["close"]
+        target = entry - (stop - entry) * 2
+    return {
+        "type": "DD_structure",
+        "direction": direction,
+        "doji1": d1,
+        "doji2": d2,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "fib_618": fib_618,
+        "ema20_dist": ema_dist,
+        "detail": f"DD结构({direction}) | 双十字星 @ {fmt_bjt(d2['dt'])} | EMA20距离={ema_dist:.2f} | 61.8%={fib_618:.2f}",
+    }
+
+def detect_wedge(bars: List[Dict], lookback: int = 30) -> Optional[Dict]:
+    """检测楔形形态（三推）"""
+    if len(bars) < lookback:
+        return None
+    recent = bars[-lookback:]
+    sh, sl = find_swing_highs_lows(recent, window=2)
+    # 需要至少3个swing high和3个swing low
+    if len(sh) < 3 or len(sl) < 3:
+        return None
+    # 下降楔形：swing highs 逐步降低，swing lows 也逐步降低，但 highs 下降幅度 > lows 下降幅度
+    # 上升楔形：swing highs 逐步升高，swing lows 也逐步升高，但 lows 上升幅度 > highs 上升幅度
+    sh_prices = [s["price"] for s in sh[-3:]]
+    sl_prices = [s["price"] for s in sl[-3:]]
+    # 三推
+    if all(sh_prices[i] > sh_prices[i+1] for i in range(len(sh_prices)-1)) and \
+       all(sl_prices[i] > sl_prices[i+1] for i in range(len(sl_prices)-1)):
+        # 下降楔形
+        high_decline = sh_prices[0] - sh_prices[-1]
+        low_decline = sl_prices[0] - sl_prices[-1]
+        if high_decline > low_decline:
+            # 推动力度递减
+            pushes = [sh_prices[i] - sh_prices[i+1] for i in range(len(sh_prices)-1)]
+            weakening = all(pushes[i] > pushes[i+1] for i in range(len(pushes)-1)) if len(pushes) >= 2 else False
+            return {
+                "type": "falling_wedge",
+                "direction": "up",  # 下降楔形通常向上突破
+                "pushes": pushes,
+                "weakening": weakening,
+                "start_price": sh_prices[0],
+                "end_price": sl_prices[-1],
+                "detail": f"下降楔形 三推 衰减={'是' if weakening else '否'} | 起点={sh_prices[0]:.2f}",
+            }
+    elif all(sh_prices[i] < sh_prices[i+1] for i in range(len(sh_prices)-1)) and \
+         all(sl_prices[i] < sl_prices[i+1] for i in range(len(sl_prices)-1)):
+        # 上升楔形
+        low_rise = sl_prices[-1] - sl_prices[0]
+        high_rise = sh_prices[-1] - sh_prices[0]
+        if low_rise > high_rise:
+            pushes = [sl_prices[i+1] - sl_prices[i] for i in range(len(sl_prices)-1)]
+            weakening = all(pushes[i] > pushes[i+1] for i in range(len(pushes)-1)) if len(pushes) >= 2 else False
+            return {
+                "type": "rising_wedge",
+                "direction": "down",  # 上升楔形通常向下突破
+                "pushes": pushes,
+                "weakening": weakening,
+                "start_price": sl_prices[0],
+                "end_price": sh_prices[-1],
+                "detail": f"上升楔形 三推 衰减={'是' if weakening else '否'} | 起点={sl_prices[0]:.2f}",
+            }
+    return None
+
+def find_high1_low1(bars: List[Dict], direction: str) -> Optional[Dict]:
+    """找 High 1 / Low 1 信号K线
+    High 1: 上升趋势中第一次回调后创新高的K线
+    Low 1: 下降趋势中第一次反弹后创新低的K线
+    """
+    if len(bars) < 5:
+        return None
+    recent = bars[-10:]
+    if direction == "up":
+        # High 1: 找最近一根创新高的K线（前5根的最高点）
+        ref_high = max(b["high"] for b in recent[:-1]) if len(recent) > 1 else 0
+        for b in recent[-3:]:
+            if b["close"] > ref_high or b["high"] > ref_high:
+                return {
+                    "type": "High1",
+                    "signal_bar": b,
+                    "entry": b["close"],
+                    "stop": b["low"],
+                    "detail": f"High1 信号K线 @ {fmt_bjt(b['dt'])} | 入场={b['close']:.2f} 止损={b['low']:.2f}",
+                }
+    elif direction == "down":
+        ref_low = min(b["low"] for b in recent[:-1]) if len(recent) > 1 else 9999
+        for b in recent[-3:]:
+            if b["close"] < ref_low or b["low"] < ref_low:
+                return {
+                    "type": "Low1",
+                    "signal_bar": b,
+                    "entry": b["close"],
+                    "stop": b["high"],
+                    "detail": f"Low1 信号K线 @ {fmt_bjt(b['dt'])} | 入场={b['close']:.2f} 止损={b['high']:.2f}",
+                }
+    return None
+
+def find_self_structured_levels(bars: List[Dict]) -> List[Dict]:
+    """找自构关键位：双底、孤立支点、两次不破等"""
+    sh, sl = find_swing_highs_lows(bars[-60:], window=2)
+    levels = []
+    # 双底（double bottom）
+    for i in range(len(sl) - 1):
+        for j in range(i + 1, len(sl)):
+            if abs(sl[i]["price"] - sl[j]["price"]) < 1.5 and sl[i]["price"] == min(sl[i]["price"], sl[j]["price"]):
+                levels.append({
+                    "type": "double_bottom",
+                    "center": (sl[i]["price"] + sl[j]["price"]) / 2,
+                    "upper": max(sl[i]["price"], sl[j]["price"]) + 0.5,
+                    "lower": min(sl[i]["price"], sl[j]["price"]) - 0.5,
+                    "touches": 2,
+                    "detail": f"双底 {sl[i]['price']:.2f}≈{sl[j]['price']:.2f}",
+                })
+    # 双顶（double top）
+    for i in range(len(sh) - 1):
+        for j in range(i + 1, len(sh)):
+            if abs(sh[i]["price"] - sh[j]["price"]) < 1.5 and sh[i]["price"] == max(sh[i]["price"], sh[j]["price"]):
+                levels.append({
+                    "type": "double_top",
+                    "center": (sh[i]["price"] + sh[j]["price"]) / 2,
+                    "upper": max(sh[i]["price"], sh[j]["price"]) + 0.5,
+                    "lower": min(sh[i]["price"], sh[j]["price"]) - 0.5,
+                    "touches": 2,
+                    "detail": f"双顶 {sh[i]['price']:.2f}≈{sh[j]['price']:.2f}",
+                })
+    return levels
+
+# ---------------- Trading Methods ----------------
+
+def method1_naked_k(bars_1h: List[Dict], bars_15m: List[Dict]) -> Dict[str, Any]:
+    """方法一：裸K交易系统
+    1. 1h EMA(21,55,144) 判断趋势
+    2. 1h 找关键支撑压力位（区间）
+    3. 15m 关键位附近 SB 结构入场
+    """
+    ema21 = ema_of_bars(bars_1h, "close", 21)
+    ema55 = ema_of_bars(bars_1h, "close", 55)
+    ema144 = ema_of_bars(bars_1h, "close", 144)
+    trend = detect_ema_trend(bars_1h, ema21, ema55, ema144)
+    levels = find_key_levels(bars_1h, lookback=100, min_touch=3)
+    direction = trend["direction"]
+    signal = None
+    if direction in ("up", "down") and levels:
+        # 检查15m是否在关键位附近出现SB结构
+        current_price = bars_15m[-1]["close"] if bars_15m else 0
+        for lvl in levels[:4]:
+            if lvl["lower"] - 3 <= current_price <= lvl["upper"] + 3:
+                # 在关键位附近
+                sb = detect_sb_structure(bars_15m, direction, lookback=20)
+                if sb:
+                    if direction == "up":
+                        stop = sb["stop"]
+                        entry = sb["entry"]
+                        target = entry + (entry - stop) * 2
+                    else:
+                        stop = sb["stop"]
+                        entry = sb["entry"]
+                        target = entry - (stop - entry) * 2
+                    signal = {
+                        "method": "裸K交易系统",
+                        "direction": "做多" if direction == "up" else "做空",
+                        "type": sb["type"],
+                        "entry": entry,
+                        "stop": stop,
+                        "target": target,
+                        "level": lvl,
+                        "detail": f"关键位[{lvl['lower']:.2f}-{lvl['upper']:.2f}] 附近 {sb['detail']}",
+                    }
+                    break
+    return {
+        "name": "裸K交易系统",
+        "trend": trend,
+        "levels": levels,
+        "signal": signal,
+        "direction": direction,
+    }
+
+def method2_dd_structure(bars_1h: List[Dict], bars_15m: List[Dict]) -> Dict[str, Any]:
+    """方法二：DD结构入场
+    1. 必须有一段明确的趋势
+    2. 回调不能跌破整段趋势的61.8%
+    3. 两个十字星越靠近EMA20越好
+    4. 越靠近极值点越好
+    5. 回调必须是简单回调
+    """
+    trend = find_trend_segment(bars_1h, min_bars=10)
+    ema20 = ema_of_bars(bars_15m, "close", 20)
+    dd = None
+    if trend:
+        dd = detect_dd_structure(bars_15m, trend, ema20)
+    fib = None
+    if trend:
+        fib = fibonacci_retracement(trend["start_price"], trend["end_price"])
+    signal = None
+    if dd:
+        signal = {
+            "method": "DD结构入场",
+            "direction": "做多" if dd["direction"] == "up" else "做空",
+            "type": dd["type"],
+            "entry": dd["entry"],
+            "stop": dd["stop"],
+            "target": dd["target"],
+            "detail": dd["detail"],
+        }
+    return {
+        "name": "DD结构入场",
+        "trend": trend,
+        "fib": fib,
+        "dd": dd,
+        "signal": signal,
+        "direction": trend["direction"] if trend else "unknown",
+    }
+
+def method3_complex_pullback(bars_1h: List[Dict], bars_15m: List[Dict]) -> Dict[str, Any]:
+    """方法三：复杂回调交易系统
+    1. EMA(21,55,144) 判断趋势 + FVG + 趋势K线判断能量
+    2. 关键位（验证次数多 + 自构关键位如双底/孤立支点）
+    3. 楔形三推 + SB结构 + High1/Low1 入场
+    """
+    ema21 = ema_of_bars(bars_1h, "close", 21)
+    ema55 = ema_of_bars(bars_1h, "close", 55)
+    ema144 = ema_of_bars(bars_1h, "close", 144)
+    trend = detect_ema_trend(bars_1h, ema21, ema55, ema144)
+    fvgs = find_fvg(bars_1h[-50:])
+    levels = find_key_levels(bars_1h, lookback=100, min_touch=3)
+    self_levels = find_self_structured_levels(bars_1h)
+    all_levels = levels + self_levels
+    wedge = detect_wedge(bars_15m, lookback=30)
+    signal = None
+    direction = trend["direction"]
+    if direction in ("up", "down") and wedge:
+        # 楔形方向与趋势方向一致
+        if wedge["direction"] == direction and wedge["weakening"]:
+            # 在关键位附近
+            current_price = bars_15m[-1]["close"] if bars_15m else 0
+            near_level = None
+            for lvl in all_levels[:5]:
+                upper = lvl.get("upper", lvl.get("center", 0))
+                lower = lvl.get("lower", lvl.get("center", 0))
+                if lower - 3 <= current_price <= upper + 3:
+                    near_level = lvl
+                    break
+            if near_level:
+                # SB结构 + High1/Low1
+                sb = detect_sb_structure(bars_15m, direction, lookback=15)
+                hl = find_high1_low1(bars_15m, direction)
+                entry_signal = sb or hl
+                if entry_signal:
+                    if direction == "up":
+                        stop = entry_signal["stop"]
+                        entry = entry_signal["entry"]
+                        target = wedge["start_price"]  # 止盈参考楔形起点
+                        if target <= entry:
+                            target = entry + (entry - stop) * 2
+                    else:
+                        stop = entry_signal["stop"]
+                        entry = entry_signal["entry"]
+                        target = wedge["start_price"]
+                        if target >= entry:
+                            target = entry - (stop - entry) * 2
+                    signal = {
+                        "method": "复杂回调系统",
+                        "direction": "做多" if direction == "up" else "做空",
+                        "type": entry_signal["type"],
+                        "entry": entry,
+                        "stop": stop,
+                        "target": target,
+                        "wedge": wedge,
+                        "level": near_level,
+                        "detail": f"楔形={wedge['type']} | 关键位={near_level.get('detail', near_level.get('center', 0))} | {entry_signal['detail']}",
+                    }
+    return {
+        "name": "复杂回调系统",
+        "trend": trend,
+        "fvgs": fvgs[-3:] if fvgs else [],
+        "levels": all_levels,
+        "wedge": wedge,
+        "signal": signal,
+        "direction": direction,
+    }
+
+# ---------------- HTML Generation ----------------
+
+def generate_html(results: List[Dict], bars_1h, bars_15m, current_price: float) -> str:
+    """生成三套方法的 HTML 报告"""
+    now_str = now_sh().strftime("%Y-%m-%d %H:%M:%S (GMT+8)")
+    # 颜色
+    C_BG = "#0a0a0a"
+    C_PANEL = "#111"
+    C_BORDER = "#1e1e1e"
+    C_BORDER2 = "#2a2a2a"
+    C_TEXT = "#e0e0e0"
+    C_DIM = "#666"
+    C_ORANGE = "#ff8800"
+    C_GREEN = "#00e676"
+    C_RED = "#ff5252"
+    C_YELLOW = "#ffab40"
+    C_BLUE = "#448aff"
+    C_PURPLE = "#e040fb"
+
+    # 当前价格
+    prev_price = bars_15m[-2]["close"] if len(bars_15m) >= 2 else current_price
+    chg = current_price - prev_price
+    chg_pct = (chg / prev_price * 100) if prev_price else 0
+    price_color = C_GREEN if chg >= 0 else C_RED
+
+    html_parts = []
+    # CSS
+    html_parts.append(f"""<style>
+:root {{ --bg:{C_BG}; --panel:{C_PANEL}; --border:{C_BORDER}; --border2:{C_BORDER2}; --text:{C_TEXT}; --dim:{C_DIM}; --orange:{C_ORANGE}; --green:{C_GREEN}; --red:{C_RED}; --yellow:{C_YELLOW}; --blue:{C_BLUE}; --purple:{C_PURPLE}; }}
 * {{ margin:0; padding:0; box-sizing:border-box; }}
-:root {{
-  --bg: #0a0a0a; --panel: #111; --border: #1e1e1e; --border2: #2a2a2a;
-  --text: #e0e0e0; --dim: #666; --dim2: #444;
-  --orange: #ff8800; --green: #00e676; --red: #ff5252; --yellow: #ffab40;
-  --mono: 'SF Mono',Menlo,Consolas,'Courier New',monospace;
-}}
-body {{ background:var(--bg); color:var(--text); font-family:var(--mono); font-size:12px; padding:12px; line-height:1.5; }}
-
-/* === Top Bar === */
-.topbar {{ display:flex; align-items:center; gap:16px; padding:10px 14px; background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:10px; }}
-.topbar .sym {{ color:var(--orange); font-size:14px; font-weight:700; letter-spacing:1px; }}
-.topbar .price {{ color:#fff; font-size:26px; font-weight:700; letter-spacing:-0.5px; }}
-.topbar .chg {{ font-size:13px; font-weight:600; }}
-.topbar .spacer {{ flex:1; }}
-.topbar .clock {{ color:var(--dim); font-size:11px; }}
-.topbar .session-dot {{ width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:4px; }}
-
-/* === Verdict Bar === */
-.verdict {{ display:flex; align-items:center; gap:16px; padding:14px 18px; background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:10px; border-left:4px solid {verdict_color}; background:{verdict_bg}; }}
-.verdict .main {{ font-size:18px; font-weight:700; color:{verdict_color}; letter-spacing:1px; }}
-.verdict .sub {{ color:var(--dim); font-size:11px; margin-top:2px; }}
-.verdict .dir-badge {{ padding:4px 12px; border-radius:3px; font-size:14px; font-weight:700; color:{dir_color}; border:1px solid {dir_color}; background:rgba(255,255,255,0.03); }}
-.verdict .progress {{ margin-left:auto; text-align:right; }}
-.verdict .progress .num {{ font-size:20px; font-weight:700; color:{verdict_color}; }}
-.verdict .progress .label {{ font-size:10px; color:var(--dim); text-transform:uppercase; }}
-
-/* === KPI Strip === */
-.kpi-strip {{ display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-bottom:10px; }}
-.kpi {{ background:var(--panel); border:1px solid var(--border); border-radius:5px; padding:8px 10px; }}
-.kpi .k {{ color:var(--dim); font-size:9px; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:2px; }}
-.kpi .v {{ color:var(--orange); font-size:15px; font-weight:700; }}
-.kpi .v.small {{ font-size:12px; }}
-
-/* === Trade Plan === */
-.trade-plan {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:12px; }}
-.tp-card {{ background:var(--panel); border:1px solid var(--border); border-radius:5px; padding:10px 12px; text-align:center; }}
-.tp-card .k {{ color:var(--dim); font-size:9px; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }}
-.tp-card .v {{ color:#fff; font-size:18px; font-weight:700; }}
-.tp-card.entry {{ border-top:2px solid var(--orange); }}
-.tp-card.stop {{ border-top:2px solid var(--red); }}
-.tp-card.target {{ border-top:2px solid var(--green); }}
-.tp-card.rr {{ border-top:2px solid var(--yellow); }}
-.tp-card.signal {{ border-top:2px solid var(--dim2); }}
-.tp-card.signal .v {{ color:var(--dim); }}
-.tp-card.signal.active .v {{ color:var(--green); }}
-
-/* === R4 Intersection === */
-.r4-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
-.r4-header {{ padding:8px 14px; background:#161616; border-bottom:1px solid var(--border2); display:flex; align-items:center; gap:8px; }}
-.r4-header .title {{ color:var(--orange); font-size:11px; font-weight:700; letter-spacing:1px; }}
-.r4-header .result {{ margin-left:auto; font-size:11px; font-weight:700; color:{r4_result_color}; padding:2px 10px; border:1px solid {r4_result_color}; border-radius:3px; }}
-.r4-cells {{ display:grid; grid-template-columns:repeat(3,1fr); gap:0; }}
-.r4-cell {{ padding:12px 14px; border-right:1px solid var(--border2); }}
-.r4-cell:last-child {{ border-right:none; }}
-.r4-cell .r4-icon {{ font-size:20px; font-weight:700; float:left; margin-right:8px; line-height:1; }}
-.r4-cell .r4-label {{ color:#aaa; font-size:11px; font-weight:600; margin-bottom:4px; }}
-.r4-cell .r4-info {{ color:var(--dim); font-size:10px; line-height:1.4; overflow:hidden; }}
-.r4-intersect {{ padding:6px 14px; background:#0d0d0d; border-top:1px solid var(--border2); color:var(--dim); font-size:10px; text-align:center; }}
-.r4-intersect .arrow {{ color:var(--orange); margin:0 6px; }}
-
-/* === Rule Groups === */
-.rule-groups {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px; }}
-.rule-group {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; overflow:hidden; }}
-.group-header {{ padding:7px 12px; background:#161616; display:flex; align-items:center; gap:6px; border-bottom:1px solid var(--border2); }}
-.group-icon {{ font-size:12px; }}
-.group-title {{ color:var(--orange); font-size:10px; font-weight:700; letter-spacing:1px; }}
-.group-count {{ margin-left:auto; font-size:11px; font-weight:700; }}
-.rule-table {{ width:100%; border-collapse:collapse; }}
-.rule-table td {{ padding:5px 12px; border-bottom:1px solid var(--border); vertical-align:top; font-size:11px; }}
-.rule-table tr:last-child td {{ border-bottom:none; }}
-.rule-table .rule-label {{ color:#bbb; width:45%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-.rule-table .rule-detail {{ color:var(--dim); font-size:10px; }}
-.rule-table tr.summary-row td {{ background:#0d0d0d; }}
-
-/* === Footer === */
-.footer {{ padding:8px 14px; color:var(--dim2); font-size:10px; border-top:1px solid var(--border); display:flex; gap:16px; }}
-.footer .tag {{ color:var(--dim); }}
-
-/* === Chart Section === */
-.chart-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
-.chart-header {{ padding:8px 14px; background:#161616; border-bottom:1px solid var(--border2); display:flex; align-items:center; gap:8px; }}
-.chart-header .title {{ color:var(--orange); font-size:11px; font-weight:700; letter-spacing:1px; }}
-.chart-header .stats {{ margin-left:auto; font-size:10px; color:var(--dim); }}
-.chart-legend {{ padding:6px 14px; background:#0d0d0d; border-top:1px solid var(--border2); font-size:10px; }}
-
-/* === Timeframe Buttons === */
-.tf-buttons {{ display:flex; gap:4px; margin-left:12px; }}
-.tf-btn {{ background:#1a1a1a; border:1px solid var(--border2); color:var(--dim); font-size:10px; font-weight:700; padding:3px 10px; border-radius:3px; cursor:pointer; letter-spacing:0.5px; transition:all 0.15s; }}
-.tf-btn:hover {{ border-color:var(--orange); color:var(--orange); }}
-.tf-btn.active {{ background:var(--orange); color:#000; border-color:var(--orange); }}
-
-/* === Signal History Table === */
-.signal-history-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
-.signal-table-wrap {{ max-height:300px; overflow-y:auto; }}
-.signal-table {{ width:100%; border-collapse:collapse; font-size:11px; }}
-.signal-table th {{ position:sticky; top:0; background:#161616; color:var(--dim); font-size:9px; text-transform:uppercase; letter-spacing:0.5px; padding:6px 8px; text-align:left; border-bottom:1px solid var(--border2); }}
-.signal-table td {{ padding:5px 8px; border-bottom:1px solid var(--border); color:#ccc; }}
-.signal-table tr:hover td {{ background:rgba(255,136,0,0.04); }}
-.signal-table .win {{ color:var(--green); font-weight:700; }}
-.signal-table .loss {{ color:var(--red); font-weight:700; }}
-.signal-table .ongoing {{ color:var(--yellow); }}
-.signal-table .long-tag {{ color:var(--green); }}
-.signal-table .short-tag {{ color:var(--red); }}
-.signal-table .pnl-pos {{ color:var(--green); }}
-.signal-table .pnl-neg {{ color:var(--red); }}
-
-/* === Signal Analysis === */
-.signal-analysis-section {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }}
-.analysis-body {{ padding:14px; font-size:11px; line-height:1.8; color:#aaa; }}
-.analysis-body h4 {{ color:var(--orange); font-size:11px; margin:0 0 6px 0; letter-spacing:1px; }}
-.analysis-body .metric-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin-bottom:12px; }}
-.analysis-body .metric {{ background:#0d0d0d; border:1px solid var(--border2); border-radius:4px; padding:8px 10px; }}
-.analysis-body .metric .label {{ font-size:9px; color:var(--dim2); text-transform:uppercase; letter-spacing:0.5px; }}
-.analysis-body .metric .value {{ font-size:16px; font-weight:700; color:#ddd; margin-top:2px; }}
-.analysis-body .metric .value.pos {{ color:var(--green); }}
-.analysis-body .metric .value.neg {{ color:var(--red); }}
-.analysis-body .sub-section {{ margin-bottom:12px; }}
-.analysis-body .tag {{ display:inline-block; background:#1a1a1a; border:1px solid var(--border2); border-radius:3px; padding:2px 6px; font-size:10px; margin:2px; color:var(--dim); }}
-.analysis-body .tag.win-tag {{ border-color:rgba(0,230,118,0.3); color:var(--green); }}
-.analysis-body .tag.loss-tag {{ border-color:rgba(255,82,82,0.3); color:var(--red); }}
-.analysis-body ul {{ margin:4px 0 4px 16px; padding:0; }}
-.analysis-body li {{ margin:2px 0; }}
-.analysis-body .suggestion {{ background:rgba(255,136,0,0.06); border:1px solid rgba(255,136,0,0.2); border-radius:4px; padding:8px 10px; margin-top:8px; }}
-.analysis-body .suggestion .label {{ color:var(--orange); font-weight:700; }}
-
-/* === Settings Gear === */
-.gear-btn {{ background:none; border:1px solid var(--border2); color:var(--dim); padding:4px 8px; border-radius:4px; cursor:pointer; font-size:14px; font-family:var(--mono); transition:all 0.2s; }}
+body {{ background:var(--bg); color:var(--text); font-family:'SF Mono',Menlo,Consolas,monospace; font-size:13px; line-height:1.6; }}
+.container {{ max-width:1400px; margin:0 auto; padding:12px; }}
+.topbar {{ display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid var(--border); margin-bottom:16px; }}
+.topbar-left {{ display:flex; align-items:center; gap:16px; }}
+.topbar-right {{ display:flex; align-items:center; gap:8px; }}
+.brand {{ font-size:18px; font-weight:bold; color:var(--orange); letter-spacing:1px; }}
+.price-box {{ display:flex; align-items:baseline; gap:8px; }}
+.price {{ font-size:22px; font-weight:bold; color:{price_color}; }}
+.chg {{ font-size:12px; color:{price_color}; }}
+.timestamp {{ font-size:11px; color:var(--dim); }}
+.gear-btn {{ background:none; border:1px solid var(--border2); color:var(--dim); padding:4px 8px; border-radius:4px; cursor:pointer; font-size:14px; font-family:inherit; transition:all 0.2s; }}
 .gear-btn:hover {{ border-color:var(--orange); color:var(--orange); }}
+.method-card {{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; }}
+.method-header {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding-bottom:10px; border-bottom:1px solid var(--border); }}
+.method-title {{ font-size:15px; font-weight:bold; color:var(--orange); }}
+.method-badge {{ padding:2px 8px; border-radius:4px; font-size:11px; font-weight:bold; }}
+.badge-up {{ background:rgba(0,230,118,0.12); color:var(--green); border:1px solid rgba(0,230,118,0.3); }}
+.badge-down {{ background:rgba(255,82,82,0.12); color:var(--red); border:1px solid rgba(255,82,82,0.3); }}
+.badge-range {{ background:rgba(102,102,102,0.12); color:var(--dim); border:1px solid var(--border2); }}
+.badge-signal {{ background:rgba(255,136,0,0.12); color:var(--orange); border:1px solid rgba(255,136,0,0.3); }}
+.section {{ margin-bottom:12px; }}
+.section-label {{ font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:1px; margin-bottom:6px; }}
+.section-content {{ font-size:12px; color:var(--text); }}
+.kv {{ display:flex; gap:6px; margin-bottom:2px; }}
+.kv-label {{ color:var(--dim); min-width:80px; }}
+.kv-value {{ color:var(--text); }}
+.level-item {{ display:inline-block; background:#161616; border:1px solid var(--border2); padding:2px 8px; border-radius:4px; margin:2px; font-size:11px; }}
+.signal-box {{ background:rgba(255,136,0,0.06); border:1px solid rgba(255,136,0,0.3); border-radius:6px; padding:12px; margin-top:8px; }}
+.signal-box-none {{ background:#0d0d0d; border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:8px; }}
+.trade-plan {{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:8px; }}
+.tp-item {{ background:#0d0d0d; border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center; }}
+.tp-label {{ font-size:10px; color:var(--dim); text-transform:uppercase; margin-bottom:4px; }}
+.tp-value {{ font-size:14px; font-weight:bold; }}
+.no-signal {{ color:var(--dim); font-size:12px; }}
+.divider {{ height:1px; background:var(--border); margin:10px 0; }}
+.wedge-info {{ font-size:11px; color:var(--blue); }}
+.fvg-item {{ display:inline-block; background:rgba(68,138,255,0.08); border:1px solid rgba(68,138,255,0.2); padding:2px 6px; border-radius:3px; margin:2px; font-size:10px; }}
+.fib-row {{ display:flex; gap:4px; flex-wrap:wrap; }}
+.fib-level {{ padding:2px 6px; border-radius:3px; font-size:10px; }}
+.chart-container {{ margin-top:12px; border:1px solid var(--border); border-radius:6px; overflow:hidden; }}
+#chart1h {{ width:100%; height:400px; }}
+#chart15m {{ width:100%; height:400px; }}
+.tabs {{ display:flex; gap:4px; margin-bottom:4px; }}
+.tab {{ padding:4px 12px; border:1px solid var(--border2); background:none; color:var(--dim); cursor:pointer; font-family:inherit; font-size:12px; border-radius:4px 4px 0 0; }}
+.tab.active {{ border-color:var(--orange); color:var(--orange); background:rgba(255,136,0,0.05); }}
+</style>""")
 
-/* === Modal === */
-.modal-overlay {{ display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000; justify-content:center; align-items:center; }}
-.modal-overlay.show {{ display:flex; }}
-.modal {{ background:var(--panel); border:1px solid var(--border2); border-radius:8px; padding:0; width:420px; max-width:90vw; box-shadow:0 8px 32px rgba(0,0,0,0.6); }}
-.modal-header {{ padding:12px 16px; border-bottom:1px solid var(--border2); display:flex; align-items:center; gap:8px; }}
-.modal-header .title {{ color:var(--orange); font-size:13px; font-weight:700; letter-spacing:1px; }}
-.modal-header .close {{ margin-left:auto; background:none; border:none; color:var(--dim); font-size:18px; cursor:pointer; padding:0 4px; }}
-.modal-header .close:hover {{ color:var(--red); }}
-.modal-body {{ padding:16px; }}
-.modal-body .field {{ margin-bottom:14px; }}
-.modal-body .field label {{ display:block; color:var(--dim); font-size:10px; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }}
-.modal-body .field input {{ width:100%; background:#0d0d0d; border:1px solid var(--border2); border-radius:4px; padding:8px 10px; color:var(--text); font-family:var(--mono); font-size:12px; }}
-.modal-body .field input:focus {{ outline:none; border-color:var(--orange); }}
-.modal-body .toggle-row {{ display:flex; align-items:center; gap:8px; margin-bottom:14px; }}
-.modal-body .toggle-row label {{ color:var(--text); font-size:12px; }}
-.modal-body .toggle {{ position:relative; width:40px; height:20px; background:#333; border-radius:10px; cursor:pointer; transition:background 0.2s; }}
-.modal-body .toggle.on {{ background:var(--green); }}
-.modal-body .toggle::after {{ content:''; position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%; background:#fff; transition:left 0.2s; }}
-.modal-body .toggle.on::after {{ left:22px; }}
-.modal-body .status-msg {{ font-size:11px; padding:6px 10px; border-radius:4px; margin-bottom:10px; display:none; }}
-.modal-body .status-msg.show {{ display:block; }}
-.modal-body .status-msg.ok {{ background:rgba(0,230,118,0.1); color:var(--green); border:1px solid rgba(0,230,118,0.3); }}
-.modal-body .status-msg.err {{ background:rgba(255,82,82,0.1); color:var(--red); border:1px solid rgba(255,82,82,0.3); }}
-.modal-footer {{ padding:10px 16px; border-top:1px solid var(--border2); display:flex; gap:8px; justify-content:flex-end; }}
-.modal-footer button {{ padding:6px 14px; border-radius:4px; font-family:var(--mono); font-size:11px; cursor:pointer; border:1px solid var(--border2); background:none; color:var(--text); }}
-.modal-footer button:hover {{ border-color:var(--orange); }}
-.modal-footer .btn-primary {{ background:var(--orange); color:#000; border-color:var(--orange); font-weight:700; }}
-.modal-footer .btn-primary:hover {{ opacity:0.85; }}
-.modal-footer .btn-test {{ border-color:var(--border2); color:var(--dim); }}
-.modal-footer .btn-test:hover {{ border-color:var(--green); color:var(--green); }}
-/* Control Panel */
-.control-panel {{ background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin: 16px 0; }}
-.cp-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
-.cp-title {{ color: var(--yellow); font-weight: 700; font-size: 13px; letter-spacing: 1px; }}
-.cp-status {{ color: var(--dim); font-size: 12px; }}
-.cp-buttons {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-.cp-btn {{ background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; font-family: inherit; transition: all .2s; }}
-.cp-btn:hover {{ border-color: var(--accent); }}
-.cp-btn.long:hover {{ border-color: var(--green); color: var(--green); }}
-.cp-btn.short:hover {{ border-color: var(--red); color: var(--red); }}
-.cp-btn.resume:hover {{ border-color: var(--yellow); color: var(--yellow); }}
-.cp-btn:disabled {{ opacity: .4; cursor: not-allowed; }}
-.cp-btn.loading {{ opacity: .6; pointer-events: none; }}
-</style>
-</head>
-<body>
-
-<!-- Top Bar -->
+    # Topbar
+    html_parts.append(f"""
 <div class="topbar">
-    <span class="sym">XAU/USD</span>
-    <span class="price">{last_price:.2f}</span>
-    <span class="chg" style="color:{up_color if chg>=0 else down_color}">{chg:+.2f} ({chg_pct:+.2f}%)</span>
-    <span class="spacer"></span>
-    <span class="clock">
-        <span class="session-dot" style="background:{up_color if checks.get('r2_trading_window',{}).get('pass') else down_color}"></span>
-        {result['now']}
-    </span>
+  <div class="topbar-left">
+    <div class="brand">XAU/USD TERMINAL v2</div>
+    <div class="price-box">
+      <span class="price">{current_price:.2f}</span>
+      <span class="chg">{'+' if chg>=0 else ''}{chg:.2f} ({'+' if chg_pct>=0 else ''}{chg_pct:.2f}%)</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span class="timestamp">{now_str}</span>
     <a href="https://macro-dashboard-taupe.vercel.app/" class="gear-btn" title="返回宏观观察台" style="text-decoration:none">← 返回</a>
     <button class="gear-btn" onclick="openSettings()" title="Telegram 通知设置">⚙</button>
+  </div>
+</div>""")
+
+    # Chart section
+    html_parts.append("""
+<div class="chart-container">
+  <div class="tabs">
+    <button class="tab active" onclick="switchChart('1h')">1H</button>
+    <button class="tab" onclick="switchChart('15m')">15M</button>
+  </div>
+  <div id="chart1h"></div>
+  <div id="chart15m" style="display:none"></div>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+var g_chart1h=null,g_chart15m=null,g_candle1h=null,g_candle15m=null;
+var g_ma21_1h=null,g_ma55_1h=null,g_ma144_1h=null;
+var g_ma21_15m=null,g_ma55_15m=null;
+function initCharts(){
+  var d1h=window._data1h||[],d15m=window._data15m||[];
+  if(d1h.length&&typeof LightweightCharts!=='undefined'){
+    var c1=document.getElementById('chart1h');
+    g_chart1h=LightweightCharts.createChart(c1,{layout:{background:{type:'solid',color:'#0a0a0a'},textColor:'#888',fontSize:11},grid:{vertLines:{color:'#141414'},horzLines:{color:'#141414'}},rightPriceScale:{borderColor:'#2a2a2a'},timeScale:{borderColor:'#2a2a2a',timeVisible:true},width:c1.clientWidth,height:400});
+    g_candle1h=g_chart1h.addCandlestickSeries({upColor:'#00e676',downColor:'#ff5252',borderUpColor:'#00e676',borderDownColor:'#ff5252',wickUpColor:'#00e676',wickDownColor:'#ff5252'});
+    g_candle1h.setData(d1h);
+    if(window._ma1h){g_ma21_1h=g_chart1h.addLineSeries({color:'#ff8800',lineWidth:2,priceLineVisible:false,lastValueVisible:false});g_ma21_1h.setData(window._ma1h.e21||[]);g_ma55_1h=g_chart1h.addLineSeries({color:'#448aff',lineWidth:2,priceLineVisible:false,lastValueVisible:false});g_ma55_1h.setData(window._ma1h.e55||[]);g_ma144_1h=g_chart1h.addLineSeries({color:'#e040fb',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false});g_ma144_1h.setData(window._ma1h.e144||[]);}
+    g_chart1h.timeScale().fitContent();
+    new ResizeObserver(function(e){if(e[0]&&g_chart1h)g_chart1h.applyOptions({width:e[0].contentRect.width});}).observe(c1);
+  }
+  if(d15m.length&&typeof LightweightCharts!=='undefined'){
+    var c2=document.getElementById('chart15m');
+    g_chart15m=LightweightCharts.createChart(c2,{layout:{background:{type:'solid',color:'#0a0a0a'},textColor:'#888',fontSize:11},grid:{vertLines:{color:'#141414'},horzLines:{color:'#141414'}},rightPriceScale:{borderColor:'#2a2a2a'},timeScale:{borderColor:'#2a2a2a',timeVisible:true},width:c2.clientWidth,height:400});
+    g_candle15m=g_chart15m.addCandlestickSeries({upColor:'#00e676',downColor:'#ff5252',borderUpColor:'#00e676',borderDownColor:'#ff5252',wickUpColor:'#00e676',wickDownColor:'#ff5252'});
+    g_candle15m.setData(d15m);
+    g_chart15m.timeScale().fitContent();
+    new ResizeObserver(function(e){if(e[0]&&g_chart15m)g_chart15m.applyOptions({width:e[0].contentRect.width});}).observe(c2);
+  }
+}
+function switchChart(t){
+  document.getElementById('chart1h').style.display=t==='1h'?'block':'none';
+  document.getElementById('chart15m').style.display=t==='15m'?'block':'none';
+  document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active');});
+  event.target.classList.add('active');
+}
+initCharts();
+</script>""")
 
-<!-- Verdict Bar -->
-<div class="verdict">
-    <div>
-        <div class="main">{verdict_text}</div>
-        <div class="sub">{verdict_sub}</div>
+    # Method cards
+    method_configs = [
+        ("1", results[0], C_GREEN, "裸K交易系统"),
+        ("2", results[1], C_BLUE, "DD结构入场"),
+        ("3", results[2], C_PURPLE, "复杂回调系统"),
+    ]
+
+    for idx, (num, r, color, name) in enumerate(method_configs):
+        direction = r["direction"]
+        dir_badge_class = "badge-up" if direction == "up" else "badge-down" if direction == "down" else "badge-range"
+        dir_text = {"up": "做多 ↗", "down": "做空 ↘", "range": "观望 ◇", "unknown": "数据不足"}.get(direction, "--")
+        signal = r.get("signal")
+        has_signal = signal is not None
+
+        html_parts.append(f'<div class="method-card">')
+        html_parts.append(f'<div class="method-header">')
+        html_parts.append(f'<div class="method-title">方法 {num} · {name}</div>')
+        html_parts.append(f'<div style="display:flex;gap:6px;align-items:center;">')
+        if has_signal:
+            html_parts.append(f'<span class="method-badge badge-signal">⚡ 信号</span>')
+        html_parts.append(f'<span class="method-badge {dir_badge_class}">{dir_text}</span>')
+        html_parts.append(f'</div></div>')
+
+        # Trend section
+        trend = r.get("trend", {})
+        html_parts.append(f'<div class="section"><div class="section-label">趋势判断 (EMA 21/55/144)</div>')
+        html_parts.append(f'<div class="section-content">{trend.get("detail", "--")}</div></div>')
+
+        if num == "2":
+            # DD structure: show fib levels and trend segment
+            trend_seg = r.get("trend")
+            fib = r.get("fib")
+            if trend_seg:
+                html_parts.append(f'<div class="section"><div class="section-label">趋势段</div>')
+                html_parts.append(f'<div class="section-content">方向={trend_seg["direction"]} | 起点={trend_seg["start_price"]:.2f} → 终点={trend_seg["end_price"]:.2f}</div></div>')
+            if fib:
+                html_parts.append(f'<div class="section"><div class="section-label">斐波那契回调</div>')
+                html_parts.append(f'<div class="fib-row">')
+                for k in ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]:
+                    v = fib[k]
+                    color = "#ff5252" if k == "61.8%" else "#666"
+                    html_parts.append(f'<span class="fib-level" style="background:#161616;color:{color};border:1px solid #2a2a2a;">{k}={v:.2f}</span>')
+                html_parts.append(f'</div></div>')
+            dd = r.get("dd")
+            if dd:
+                html_parts.append(f'<div class="section"><div class="section-label">DD结构检测</div>')
+                html_parts.append(f'<div class="section-content">{dd["detail"]}</div></div>')
+
+        elif num == "3":
+            # Complex pullback: FVG, levels, wedge
+            fvgs = r.get("fvgs", [])
+            if fvgs:
+                html_parts.append(f'<div class="section"><div class="section-label">FVG (Fair Value Gap)</div>')
+                for fvg in fvgs:
+                    html_parts.append(f'<span class="fvg-item">{fvg["type"]} {fvg["lower"]:.2f}-{fvg["upper"]:.2f} @ {fmt_bjt(fvg["dt"])}</span>')
+                html_parts.append(f'</div>')
+            wedge = r.get("wedge")
+            if wedge:
+                html_parts.append(f'<div class="section"><div class="section-label">楔形形态</div>')
+                html_parts.append(f'<div class="wedge-info">{wedge["detail"]} | 推动力度衰减={"✓" if wedge["weakening"] else "✗"}</div></div>')
+            else:
+                html_parts.append(f'<div class="section"><div class="section-label">楔形形态</div><div class="no-signal">未检测到楔形</div></div>')
+
+        # Levels
+        levels = r.get("levels", [])
+        if levels:
+            html_parts.append(f'<div class="section"><div class="section-label">关键位 (支撑/压力区间)</div>')
+            for lvl in levels[:5]:
+                l_type = lvl.get("type", "level")
+                html_parts.append(f'<span class="level-item">{l_type}: [{lvl["lower"]:.2f} - {lvl["upper"]:.2f}] ×{lvl.get("touches",1)}</span>')
+            html_parts.append(f'</div>')
+
+        # Signal
+        if has_signal:
+            html_parts.append(f'<div class="signal-box">')
+            html_parts.append(f'<div style="color:var(--orange);font-weight:bold;margin-bottom:6px;">⚡ 入场信号 — {signal["direction"]}</div>')
+            html_parts.append(f'<div style="font-size:12px;margin-bottom:8px;">{signal["detail"]}</div>')
+            html_parts.append(f'<div class="trade-plan">')
+            html_parts.append(f'<div class="tp-item"><div class="tp-label">入场</div><div class="tp-value" style="color:var(--green)">{signal["entry"]:.2f}</div></div>')
+            html_parts.append(f'<div class="tp-item"><div class="tp-label">止损</div><div class="tp-value" style="color:var(--red)">{signal["stop"]:.2f}</div></div>')
+            html_parts.append(f'<div class="tp-item"><div class="tp-label">止盈 (1:2)</div><div class="tp-value" style="color:var(--green)">{signal["target"]:.2f}</div></div>')
+            risk = abs(signal["entry"] - signal["stop"])
+            reward = abs(signal["target"] - signal["entry"])
+            rr = reward / risk if risk > 0 else 0
+            html_parts.append(f'<div class="tp-item"><div class="tp-label">盈亏比</div><div class="tp-value" style="color:var(--yellow)">{rr:.1f}R</div></div>')
+            html_parts.append(f'</div></div>')
+        else:
+            no_signal_text = "均线缠绕，观望" if direction == "range" else "关键位附近未出现入场信号" if direction in ("up", "down") else "趋势不明确"
+            html_parts.append(f'<div class="signal-box-none"><div class="no-signal">⏸ {no_signal_text}</div></div>')
+
+        html_parts.append(f'</div>')  # close method-card
+
+    # Settings modal
+    html_parts.append("""
+<div id="settingsModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;">
+  <div style="background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:24px;width:400px;">
+    <h3 style="color:#ff8800;margin-bottom:16px;">Telegram 通知设置</h3>
+    <div style="margin-bottom:12px;"><label style="color:#666;font-size:12px;display:block;margin-bottom:4px;">Bot Token</label><input id="tg_token" style="width:100%;background:#0a0a0a;border:1px solid #2a2a2a;color:#e0e0e0;padding:8px;border-radius:4px;font-family:inherit;" /></div>
+    <div style="margin-bottom:12px;"><label style="color:#666;font-size:12px;display:block;margin-bottom:4px;">Chat ID</label><input id="tg_chat" style="width:100%;background:#0a0a0a;border:1px solid #2a2a2a;color:#e0e0e0;padding:8px;border-radius:4px;font-family:inherit;" /></div>
+    <div style="margin-bottom:16px;"><label style="color:#666;font-size:12px;display:flex;align-items:center;gap:6px;"><input type="checkbox" id="tg_enabled" /> 启用通知</label></div>
+    <div style="display:flex;gap:8px;">
+      <button onclick="saveSettings()" style="flex:1;background:#ff8800;color:#0a0a0a;border:none;padding:8px;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:bold;">保存</button>
+      <button onclick="testTelegram()" style="flex:1;background:none;border:1px solid #2a2a2a;color:#ff8800;padding:8px;border-radius:4px;cursor:pointer;font-family:inherit;">测试</button>
+      <button onclick="document.getElementById('settingsModal').style.display='none'" style="background:none;border:1px solid #2a2a2a;color:#666;padding:8px;border-radius:4px;cursor:pointer;font-family:inherit;">关闭</button>
     </div>
-    <div class="dir-badge">{dir_text}</div>
-    <div class="progress">
-        <div class="num">{pass_count}/{total_count}</div>
-        <div class="label">Rules Passed</div>
-    </div>
+    <div id="tg_result" style="margin-top:12px;font-size:12px;color:#666;"></div>
+  </div>
 </div>
-
-<!-- KPI Strip -->
-<div class="kpi-strip">
-    <div class="kpi"><div class="k">1H Direction</div><div class="v">{result['direction'].upper()}</div></div>
-    <div class="kpi"><div class="k">Day Mode</div><div class="v small">{day_mode}</div></div>
-    <div class="kpi"><div class="k">ATR(5m,14)</div><div class="v">{result['atr_5m']:.2f}</div></div>
-    <div class="kpi"><div class="k">Stop Dist</div><div class="v">{result['stop_distance']:.2f}</div></div>
-    <div class="kpi"><div class="k">Target R</div><div class="v small">{result['target_R']}</div></div>
-    <div class="kpi"><div class="k">Daily P&L</div><div class="v" style="color:{up_color if daily_loss==0 else down_color}">{daily_loss:.1f}R / 2.0R</div></div>
-</div>
-
-<!-- Trade Plan -->
-<div class="trade-plan">
-    <div class="tp-card entry"><div class="k">Entry</div><div class="v">{entry_str}</div></div>
-    <div class="tp-card stop"><div class="k">Stop Loss</div><div class="v">{stop_str}</div></div>
-    <div class="tp-card target"><div class="k">Target</div><div class="v">{target_str}</div></div>
-    <div class="tp-card rr"><div class="k">R:R Ratio</div><div class="v">{rr_str}</div></div>
-    <div class="tp-card signal {'active' if signal_name != 'none' else ''}"><div class="k">Signal</div><div class="v">{signal_name.upper()}</div></div>
-</div>
-
-<!-- Manual Control Panel -->
-<div class="control-panel" id="controlPanel">
-    <div class="cp-header">
-        <span class="cp-title">⚙ 手动控制</span>
-        <span class="cp-status" id="cpStatus">--</span>
-    </div>
-    <div class="cp-buttons">
-        <button class="cp-btn long" onclick="sendOverride('long')">📈 做多</button>
-        <button class="cp-btn short" onclick="sendOverride('short')">📉 做空</button>
-        <button class="cp-btn resume" onclick="sendOverride('resume')">🔄 恢复自动</button>
-        <button class="cp-btn refresh" onclick="refreshPage()">🔄 刷新</button>
-    </div>
-</div>
-
-<!-- R4 Intersection -->
-<div class="r4-section">
-    <div class="r4-header">
-        <span class="title">R4 DAY MODE — 三条件交集</span>
-        <span class="result">{r4_result_text}</span>
-    </div>
-    <div class="r4-cells">
-        {r4_cells_html}
-    </div>
-    <div class="r4-intersect">
-        幅度方向 <span class="arrow">∩</span> 结构方向 <span class="arrow">∩</span> 突破方向 <span class="arrow">=</span>
-        <strong style="color:{r4_result_color}">{r4_result_text}</strong>
-        <span style="margin-left:8px;color:var(--dim2)">不一致则降级为震荡日, 排除宽幅震荡误判</span>
-    </div>
-</div>
-
-<!-- Rule Groups -->
-<div class="rule-groups">
-    {groups_html}
-</div>
-
-<!-- TradingView Chart + Signal History -->
-<div class="chart-section">
-    <div class="chart-header">
-        <span class="title">📈 K线图 + 信号标记</span>
-        <div class="tf-buttons">
-            <button class="tf-btn active" data-tf="5m" onclick="switchTf('5m')">5min</button>
-            <button class="tf-btn" data-tf="1h" onclick="switchTf('1h')">1H</button>
-        </div>
-        <span class="stats" id="chartStats">{stats_text}</span>
-    </div>
-    <div id="tradingChart" style="width:100%;height:500px;background:#0a0a0a;"></div>
-    <div class="chart-legend">
-        <span style="color:{up_color}">▲ 做多 (H1/H2)</span>
-        <span style="color:{down_color};margin-left:16px">▼ 做空 (L1/L2)</span>
-        <span style="color:var(--dim);margin-left:16px">✓止盈 ✗止损 …进行中</span>
-        <span style="color:var(--dim);margin-left:16px">鼠标拖拽平移 · 滚轮缩放</span>
-    </div>
-</div>
-
-<div class="signal-history-section">
-    <div class="chart-header">
-        <span class="title">📋 信号历史记录</span>
-        <span class="stats">事后验证盈亏</span>
-    </div>
-    <div class="signal-table-wrap">
-        <table class="signal-table" id="signalTable">
-            <thead>
-                <tr>
-                    <th>时间</th>
-                    <th>信号</th>
-                    <th>方向</th>
-                    <th>触发逻辑</th>
-                    <th>入场价</th>
-                    <th>止损</th>
-                    <th>目标</th>
-                    <th>结果</th>
-                    <th>出场价</th>
-                    <th>出场时间</th>
-                    <th>盈亏(点)</th>
-                    <th>K线数</th>
-                    <th>策略动作</th>
-                </tr>
-            </thead>
-            <tbody id="signalTableBody"></tbody>
-        </table>
-    </div>
-</div>
-
-<!-- Signal Analysis -->
-<div class="signal-analysis-section">
-    <div class="chart-header">
-        <span class="title">📊 信号历史整体分析</span>
-        <span class="stats" id="analysisStats">自动生成</span>
-    </div>
-    <div id="signalAnalysis" class="analysis-body"></div>
-</div>
-
-<!-- Footer -->
-<div class="footer">
-    <span class="tag">Data: Yahoo Finance (GC=F)</span>
-    <span class="tag">Auto-refresh: 300s · 手动刷新即时取最新数据</span>
-    <span class="tag">Session: 15:00-23:30 GMT+8</span>
-    <span style="margin-left:auto;color:var(--dim2)">顺势交易 · R计量风险 · 个人可执行性优先</span>
-</div>
-
-<!-- Settings Modal -->
-<div class="modal-overlay" id="settingsModal" onclick="if(event.target===this)closeSettings()">
-    <div class="modal">
-        <div class="modal-header">
-            <span class="title">⚙ TELEGRAM 通知设置</span>
-            <button class="close" onclick="closeSettings()">×</button>
-        </div>
-        <div class="modal-body">
-            <div class="status-msg" id="tgStatus"></div>
-            <div class="toggle-row">
-                <div class="toggle" id="tgToggle" onclick="toggleTg()"></div>
-                <label>启用 Telegram 推送</label>
-            </div>
-            <div class="field">
-                <label>Bot Token</label>
-                <input type="text" id="tgToken" placeholder="1234567890:ABCdefGHI..." autocomplete="off">
-            </div>
-            <div class="field">
-                <label>Chat ID</label>
-                <input type="text" id="tgChatId" placeholder="你的 Telegram Chat ID" autocomplete="off">
-            </div>
-        </div>
-        <div class="modal-footer">
-            <button class="btn-test" onclick="testTelegram()">📡 测试连接</button>
-            <button class="btn-primary" onclick="saveTelegram()">💾 保存</button>
-        </div>
-    </div>
-</div>
-
-__SCRIPT_PLACEHOLDER__
-
-</body>
-</html>"""
-    # JS 部分包含大量花括号，不能放在 f-string 中
-    js_code = '''<script>
-let tgEnabled = false;
-let currentOverride = localStorage.getItem('manual_override') || null;
-
-// 更新控制面板状态显示
-function updateCpStatus() {
-    const el = document.getElementById('cpStatus');
-    if (!el) return;
-    if (currentOverride === 'long') el.textContent = '强制做多';
-    else if (currentOverride === 'short') el.textContent = '强制做空';
-    else if (currentOverride === 'resume') el.textContent = '已恢复自动';
-    else el.textContent = '自动模式';
+<script>
+function openSettings(){
+  fetch('/api/config').then(r=>r.json()).then(d=>{
+    document.getElementById('tg_token').value=d.telegram_bot_token||'';
+    document.getElementById('tg_chat').value=d.telegram_chat_id||'';
+    document.getElementById('tg_enabled').checked=d.telegram_enabled||false;
+  }).catch(()=>{});
+  document.getElementById('settingsModal').style.display='flex';
 }
-updateCpStatus();
-
-// 发送手动覆盖指令
-async function sendOverride(action) {
-    const btns = document.querySelectorAll('.cp-btn');
-    btns.forEach(b => b.classList.add('loading'));
-    try {
-        // 存到 localStorage
-        if (action === 'resume') {
-            localStorage.removeItem('manual_override');
-            currentOverride = null;
-        } else {
-            localStorage.setItem('manual_override', action);
-            currentOverride = action;
-        }
-        // 带 override 参数重新加载
-        const url = '/scan?override=' + encodeURIComponent(action);
-        const r = await fetch(url);
-        const html = await r.text();
-        document.open();
-        document.write(html);
-        document.close();
-    } catch (e) {
-        alert('发送失败: ' + e.message);
-    } finally {
-        btns.forEach(b => b.classList.remove('loading'));
-    }
+function saveSettings(){
+  var d={bot_token:document.getElementById('tg_token').value,chat_id:document.getElementById('tg_chat').value,enabled:document.getElementById('tg_enabled').checked};
+  fetch('/api/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(res=>{
+    document.getElementById('tg_result').textContent=res.message||'已保存';
+  }).catch(e=>{document.getElementById('tg_result').textContent='保存失败:'+e;});
 }
-
-// 刷新页面 (不带 override, 用 localStorage 中的值)
-function refreshPage() {
-    const override = localStorage.getItem('manual_override');
-    const url = override ? '/scan?override=' + encodeURIComponent(override) : '/scan';
-    window.location.href = url;
+function testTelegram(){
+  var token=document.getElementById('tg_token').value,chat=document.getElementById('tg_chat').value;
+  fetch('/api/telegram/test?token='+encodeURIComponent(token)+'&chat_id='+encodeURIComponent(chat)).then(r=>r.json()).then(res=>{
+    document.getElementById('tg_result').textContent=res.ok?'✅ '+res.message:'❌ '+res.error;
+  }).catch(e=>{document.getElementById('tg_result').textContent='请求失败:'+e;});
 }
+</script>""")
 
-// 页面加载时自动带 localStorage 中的 override
-(function autoApplyOverride() {
-    const override = localStorage.getItem('manual_override');
-    const urlParams = new URLSearchParams(window.location.search);
-    const hasOverrideParam = urlParams.has('override');
-    if (override && !hasOverrideParam) {
-        // 自动刷新带 override
-        window.location.replace('/scan?override=' + encodeURIComponent(override));
-    }
-})();
+    return "\n".join(html_parts)
 
-async function loadSettings() {
-    try {
-        const r = await fetch('/config');
-        const cfg = await r.json();
-        document.getElementById('tgToken').value = cfg.telegram_bot_token || '';
-        document.getElementById('tgChatId').value = cfg.telegram_chat_id || '';
-        tgEnabled = !!cfg.telegram_enabled;
-        updateToggle();
-    } catch(e) { console.error('loadSettings error', e); }
-}
+# ---------------- Chart Data Preparation ----------------
 
-function updateToggle() {
-    const el = document.getElementById('tgToggle');
-    if (tgEnabled) el.classList.add('on'); else el.classList.remove('on');
-}
+def prepare_chart_data(bars_1h, bars_15m):
+    """为前端图表准备 JSON 数据"""
+    # 1H candles
+    candle_1h = []
+    for b in bars_1h[-200:]:
+        t = b["ts"]
+        candle_1h.append({"time": t, "open": b["open"], "high": b["high"], "low": b["low"], "close": b["close"]})
+    # 1H EMAs
+    e21_1h = ema_of_bars(bars_1h, "close", 21)
+    e55_1h = ema_of_bars(bars_1h, "close", 55)
+    e144_1h = ema_of_bars(bars_1h, "close", 144)
+    ma1h = {"e21": [], "e55": [], "e144": []}
+    for i, b in enumerate(bars_1h[-200:]):
+        idx = len(bars_1h) - 200 + i
+        if e21_1h[idx] is not None:
+            ma1h["e21"].append({"time": b["ts"], "value": e21_1h[idx]})
+        if e55_1h[idx] is not None:
+            ma1h["e55"].append({"time": b["ts"], "value": e55_1h[idx]})
+        if e144_1h[idx] is not None:
+            ma1h["e144"].append({"time": b["ts"], "value": e144_1h[idx]})
+    # 15m candles
+    candle_15m = []
+    for b in bars_15m[-300:]:
+        candle_15m.append({"time": b["ts"], "open": b["open"], "high": b["high"], "low": b["low"], "close": b["close"]})
+    return candle_1h, ma1h, candle_15m
 
-function toggleTg() { tgEnabled = !tgEnabled; updateToggle(); }
+# ---------------- State (GitHub persistent) ----------------
 
-function openSettings() {
-    loadSettings();
-    document.getElementById('settingsModal').classList.add('show');
-    document.getElementById('tgStatus').classList.remove('show');
-}
+def load_state() -> Dict[str, Any]:
+    """加载状态——Vercel 环境下用 GitHub repo 持久化"""
+    if not GITHUB_TOKEN:
+        return {}
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STATE_PATH}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            state = json.loads(content)
+            state["_gh_sha"] = data["sha"]
+            return state
+        return {}
+    except Exception as e:
+        log(f"GitHub state 读取失败: {e}")
+        return {}
 
-function closeSettings() {
-    document.getElementById('settingsModal').classList.remove('show');
-}
+# ---------------- Telegram Push ----------------
 
-function showStatus(msg, isOk) {
-    const el = document.getElementById('tgStatus');
-    el.textContent = msg;
-    el.className = 'status-msg show ' + (isOk ? 'ok' : 'err');
-}
-
-async function testTelegram() {
-    const token = document.getElementById('tgToken').value.trim();
-    const chatId = document.getElementById('tgChatId').value.trim();
-    if (!token || !chatId) { showStatus('请先填写 Bot Token 和 Chat ID', false); return; }
-    showStatus('正在测试...', false);
-    try {
-        const r = await fetch(`/api/telegram/test?token=${encodeURIComponent(token)}&chat_id=${encodeURIComponent(chatId)}`);
-        const data = await r.json();
-        if (data.ok) showStatus('✅ ' + data.message, true);
-        else showStatus('❌ ' + data.error, false);
-    } catch(e) { showStatus('❌ ' + e.message, false); }
-}
-
-async function saveTelegram() {
-    const token = document.getElementById('tgToken').value.trim();
-    const chatId = document.getElementById('tgChatId').value.trim();
-    try {
-        const r = await fetch('/api/telegram', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ bot_token: token, chat_id: chatId, enabled: tgEnabled })
-        });
-        const data = await r.json();
-        if (data.ok) {
-            showStatus('✅ ' + data.message, true);
-            setTimeout(closeSettings, 1200);
-        } else {
-            showStatus('❌ ' + data.error, false);
-        }
-    } catch(e) { showStatus('❌ ' + e.message, false); }
-}
-
-// === Lightweight Charts ===
-const CHART_BARS_5M = ''' + chart_bars_5m_json + ''';
-const CHART_BARS_1H = ''' + chart_bars_1h_json + ''';
-const CHART_MARKERS = ''' + chart_markers_json + ''';
-const SIG_HISTORY = ''' + sig_history_json + ''';
-
-let g_chart = null;
-let g_series = null;
-let g_currentTf = '5m';
-
-function loadChart() {
-    const container = document.getElementById('tradingChart');
-    if (!container || typeof LightweightCharts === 'undefined') return;
-    
-    g_chart = LightweightCharts.createChart(container, {
-        layout: {
-            background: { type: 'solid', color: '#0a0a0a' },
-            textColor: '#888',
-            fontSize: 11,
-        },
-        grid: {
-            vertLines: { color: '#141414' },
-            horzLines: { color: '#141414' },
-        },
-        crosshair: {
-            mode: LightweightCharts.CrosshairMode.Normal,
-            vertLine: { color: '#ff8800', labelBackgroundColor: '#ff8800', width: 1, style: LightweightCharts.LineStyle.Dashed },
-            horzLine: { color: '#ff8800', labelBackgroundColor: '#ff8800', width: 1, style: LightweightCharts.LineStyle.Dashed },
-        },
-        rightPriceScale: {
-            borderColor: '#2a2a2a',
-            scaleMargins: { top: 0.08, bottom: 0.08 },
-        },
-        timeScale: {
-            borderColor: '#2a2a2a',
-            timeVisible: true,
-            secondsVisible: false,
-            rightOffset: 5,
-            barSpacing: 6,
-        },
-        width: container.clientWidth,
-        height: 500,
-    });
-    
-    applyTfData('5m');
-    
-    // 响应式
-    new ResizeObserver(entries => {
-        if (entries[0] && g_chart) {
-            g_chart.applyOptions({ width: entries[0].contentRect.width });
-        }
-    }).observe(container);
-}
-
-function applyTfData(tf) {
-    if (!g_chart) return;
-    g_currentTf = tf;
-    
-    // 移除旧 series
-    if (g_series) {
-        g_chart.removeSeries(g_series);
-        g_series = null;
-    }
-    
-    const data = tf === '5m' ? CHART_BARS_5M : CHART_BARS_1H;
-    
-    g_series = g_chart.addCandlestickSeries({
-        upColor: '#00e676',
-        downColor: '#ff5252',
-        borderUpColor: '#00e676',
-        borderDownColor: '#ff5252',
-        wickUpColor: '#00e676',
-        wickDownColor: '#ff5252',
-        priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
-    });
-    
-    g_series.setData(data);
-    
-    // 信号 markers — 只在 5min 图上显示
-    if (tf === '5m' && CHART_MARKERS.length > 0) {
-        g_series.setMarkers(CHART_MARKERS.map(m => ({
-            time: m.time,
-            position: m.position,
-            color: m.color,
-            shape: m.shape,
-            text: m.text,
-        })));
-    }
-    
-    g_chart.timeScale().fitContent();
-    
-    // 更新统计
-    updateChartStats(tf);
-}
-
-function switchTf(tf) {
-    document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
-    document.querySelector('.tf-btn[data-tf="' + tf + '"]').classList.add('active');
-    applyTfData(tf);
-}
-
-function updateChartStats(tf) {
-    const el = document.getElementById('chartStats');
-    if (!el) return;
-    const data = tf === '5m' ? CHART_BARS_5M : CHART_BARS_1H;
-    const count = data.length;
-    const lastBar = data[data.length - 1];
-    const firstBar = data[0];
-    el.textContent = `${tf.toUpperCase()} · ${count} 根K线 · ${firstBar ? new Date(firstBar.time * 1000).toLocaleDateString() : ''} → ${lastBar ? new Date(lastBar.time * 1000).toLocaleDateString() : ''}`;
-}
-
-function renderSignalTable() {
-    const tbody = document.getElementById('signalTableBody');
-    if (!tbody) return;
-    
-    if (!SIG_HISTORY || SIG_HISTORY.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--dim);padding:20px">暂无历史信号记录</td></tr>';
-        return;
-    }
-    
-    tbody.innerHTML = SIG_HISTORY.slice().reverse().map(s => {
-        const resultClass = s.result === 'win' ? 'win' : s.result === 'loss' ? 'loss' : 'ongoing';
-        const resultText = s.result === 'win' ? '✅ 止盈' : s.result === 'loss' ? '❌ 止损' : '⏳ 进行中';
-        const dirClass = s.type === 'long' ? 'long-tag' : 'short-tag';
-        const dirText = s.type === 'long' ? '做多' : '做空';
-        const pnlClass = s.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-        const reasonText = s.reason || '--';
-        const globalDirText = s.global_dir === 'up' ? '↑UP' : s.global_dir === 'down' ? '↓DOWN' : 'RANGE';
-        // 策略动作
-        let actionText = '--';
-        let actionClass = '';
-        if (s.sim_action === 'flipped') {
-            actionText = '🔄 反手';
-            actionClass = 'style="color:var(--orange);font-weight:700"';
-        } else if (s.sim_action === 'skipped_stopped') {
-            actionText = '⛔ 跳过';
-            actionClass = 'style="color:var(--red);font-weight:700"';
-        } else if (s.sim_action === 'skipped_pending') {
-            actionText = '⏸ 不开仓';
-            actionClass = 'style="color:var(--yellow);font-weight:700"';
-        } else if (s.sim_action === 'pending') {
-            actionText = '⏸ 不开仓';
-            actionClass = 'style="color:var(--yellow);font-weight:700"';
-        } else if (s.sim_action === 'normal') {
-            actionText = '✓ 正常';
-            actionClass = 'style="color:var(--dim)"';
-        }
-        const simNote = s.sim_note ? `<br><span style="font-size:9px;color:var(--dim2)">${s.sim_note}</span>` : '';
-        return `<tr>
-            <td>${s.time}</td>
-            <td><strong>${s.signal}</strong></td>
-            <td class="${dirClass}">${dirText}</td>
-            <td style="font-size:10px;color:#999;max-width:280px;white-space:normal">${reasonText}<br><span style="color:var(--dim2)">1H方向:${globalDirText}</span></td>
-            <td>${s.entry.toFixed(2)}</td>
-            <td>${s.stop.toFixed(2)}</td>
-            <td>${s.target.toFixed(2)}</td>
-            <td class="${resultClass}">${resultText}</td>
-            <td>${s.exit ? s.exit.toFixed(2) : '--'}</td>
-            <td>${s.exit_time || '--'}</td>
-            <td class="${pnlClass}">${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(1)}</td>
-            <td>${s.bars_after}</td>
-            <td ${actionClass}>${actionText}${simNote}</td>
-        </tr>`;
-    }).join('');
-    
-    renderAnalysis();
-}
-
-function renderAnalysis() {
-    const el = document.getElementById('signalAnalysis');
-    if (!el) return;
-    
-    if (!SIG_HISTORY || SIG_HISTORY.length === 0) {
-        el.innerHTML = '<div style="text-align:center;color:var(--dim);padding:20px">暂无信号数据，无法分析</div>';
-        return;
-    }
-    
-    const all = SIG_HISTORY;
-    const completed = all.filter(s => s.result === 'win' || s.result === 'loss');
-    const ongoing = all.filter(s => s.result === 'ongoing');
-    const wins = completed.filter(s => s.result === 'win');
-    const losses = completed.filter(s => s.result === 'loss');
-    const longs = all.filter(s => s.type === 'long');
-    const shorts = all.filter(s => s.type === 'short');
-    const longCompleted = longs.filter(s => s.result !== 'ongoing');
-    const shortCompleted = shorts.filter(s => s.result !== 'ongoing');
-    const longWins = longCompleted.filter(s => s.result === 'win');
-    const shortWins = shortCompleted.filter(s => s.result === 'win');
-    
-    const winrate = completed.length > 0 ? (wins.length / completed.length * 100) : 0;
-    const longWinrate = longCompleted.length > 0 ? (longWins.length / longCompleted.length * 100) : 0;
-    const shortWinrate = shortCompleted.length > 0 ? (shortWins.length / shortCompleted.length * 100) : 0;
-    const totalPnl = completed.reduce((sum, s) => sum + s.pnl, 0);
-    const avgWin = wins.length > 0 ? wins.reduce((sum, s) => sum + s.pnl, 0) / wins.length : 0;
-    const avgLoss = losses.length > 0 ? losses.reduce((sum, s) => sum + s.pnl, 0) / losses.length : 0;
-    const avgBars = completed.length > 0 ? completed.reduce((sum, s) => sum + s.bars_after, 0) / completed.length : 0;
-    const profitFactor = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
-    
-    // 信号类型统计
-    const sigTypes = {};
-    all.forEach(s => {
-        const key = s.signal;
-        if (!sigTypes[key]) sigTypes[key] = {total: 0, wins: 0, losses: 0, ongoing: 0, pnl: 0};
-        sigTypes[key].total++;
-        if (s.result === 'win') { sigTypes[key].wins++; sigTypes[key].pnl += s.pnl; }
-        else if (s.result === 'loss') { sigTypes[key].losses++; sigTypes[key].pnl += s.pnl; }
-        else sigTypes[key].ongoing++;
-    });
-    
-    // 期望值计算
-    const expectancy = completed.length > 0 ? totalPnl / completed.length : 0;
-    
-    // 生成分析HTML
-    let html = '';
-    
-    // 预计算分类统计 (用于指标网格和后续分析)
-    const flippedSignals = all.filter(s => s.sim_action === 'flipped');
-    const skippedSignals = all.filter(s => s.sim_action === 'skipped_stopped');
-    const pendingSignals = all.filter(s => s.sim_action === 'skipped_pending' || s.sim_action === 'pending');
-    const normalSignals = all.filter(s => s.sim_action === 'normal');
-    
-    // 指标网格
-    html += '<h4>核心指标</h4>';
-    html += '<div class="metric-grid">';
-    html += `<div class="metric"><div class="label">总信号数</div><div class="value">${all.length}</div></div>`;
-    html += `<div class="metric"><div class="label">已完成</div><div class="value">${completed.length}</div></div>`;
-    html += `<div class="metric"><div class="label">进行中</div><div class="value" style="color:var(--yellow)">${ongoing.length}</div></div>`;
-    html += `<div class="metric"><div class="label">胜率</div><div class="value ${winrate >= 50 ? 'pos' : 'neg'}">${winrate.toFixed(0)}%</div></div>`;
-    html += `<div class="metric"><div class="label">总盈亏</div><div class="value ${totalPnl >= 0 ? 'pos' : 'neg'}">${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(1)}点</div></div>`;
-    html += `<div class="metric"><div class="label">期望值/笔</div><div class="value ${expectancy >= 0 ? 'pos' : 'neg'}">${expectancy >= 0 ? '+' : ''}${expectancy.toFixed(1)}点</div></div>`;
-    html += `<div class="metric"><div class="label">盈亏比(PF)</div><div class="value ${profitFactor >= 1 ? 'pos' : 'neg'}">${profitFactor.toFixed(2)}</div></div>`;
-    html += `<div class="metric"><div class="label">平均持仓</div><div class="value">${avgBars.toFixed(0)}根</div></div>`;
-    html += `<div class="metric"><div class="label">平均盈利</div><div class="value pos">+${avgWin.toFixed(1)}</div></div>`;
-    html += `<div class="metric"><div class="label">平均亏损</div><div class="value neg">${avgLoss.toFixed(1)}</div></div>`;
-    html += `<div class="metric"><div class="label">连亏反手</div><div class="value" style="color:var(--orange)">${flippedSignals.length}次</div></div>`;
-    html += `<div class="metric"><div class="label">待确认</div><div class="value" style="color:var(--yellow)">${pendingSignals.length}次</div></div>`;
-    html += `<div class="metric"><div class="label">停止交易</div><div class="value" style="color:var(--red)">${skippedSignals.length}次</div></div>`;
-    html += '</div>';
-    
-    // 多空对比
-    html += '<h4>多空对比</h4>';
-    html += '<div class="metric-grid">';
-    html += `<div class="metric"><div class="label">做多信号</div><div class="value" style="color:var(--green)">${longs.length}笔</div></div>`;
-    html += `<div class="metric"><div class="label">做多胜率</div><div class="value ${longWinrate >= 50 ? 'pos' : 'neg'}">${longCompleted.length > 0 ? longWinrate.toFixed(0) + '%' : '--'}</div></div>`;
-    html += `<div class="metric"><div class="label">做空信号</div><div class="value" style="color:var(--red)">${shorts.length}笔</div></div>`;
-    html += `<div class="metric"><div class="label">做空胜率</div><div class="value ${shortWinrate >= 50 ? 'pos' : 'neg'}">${shortCompleted.length > 0 ? shortWinrate.toFixed(0) + '%' : '--'}</div></div>`;
-    html += '</div>';
-    
-    // 信号类型分解
-    html += '<h4>信号类型分解</h4>';
-    html += '<div style="margin-bottom:10px">';
-    Object.keys(sigTypes).forEach(key => {
-        const t = sigTypes[key];
-        const wr = (t.wins + t.losses) > 0 ? (t.wins / (t.wins + t.losses) * 100) : 0;
-        const cls = wr >= 50 ? 'win-tag' : 'loss-tag';
-        html += `<span class="tag ${cls}">${key}: ${t.total}笔 | ${t.wins}W/${t.losses}L | 胜率${wr.toFixed(0)}% | PNL${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(1)}</span>`;
-    });
-    html += '</div>';
-    
-    // 诊断与建议
-    html += '<h4>诊断与改进建议</h4>';
-    const suggestions = [];
-    
-    // 连亏反手统计
-    if (flippedSignals.length > 0 || skippedSignals.length > 0 || pendingSignals.length > 0) {
-        suggestions.push(`连亏反手模拟: ${flippedSignals.length}次反手(大盘方向确认), ${pendingSignals.length}次不开仓(大盘方向未改), ${skippedSignals.length}次跳过停止`);
-    }
-    
-    // 反手后的表现
-    if (flippedSignals.length > 0) {
-        const afterFlip = all.filter((s, i) => {
-            // 找反手之后的信号
-            const prevFlipped = all.slice(0, i).some(p => p.sim_action === 'flipped');
-            return prevFlipped && s.sim_action !== 'skipped_stopped';
-        });
-        const afterFlipCompleted = afterFlip.filter(s => s.result !== 'ongoing');
-        const afterFlipWins = afterFlipCompleted.filter(s => s.result === 'win');
-        if (afterFlipCompleted.length > 0) {
-            const flipWinrate = (afterFlipWins.length / afterFlipCompleted.length * 100).toFixed(0);
-            suggestions.push(`反手后胜率: ${flipWinrate}% (${afterFlipWins.length}W/${afterFlipCompleted.length - afterFlipWins.length}L), 验证反手策略是否有效`);
-        }
-    }
-    
-    if (completed.length < 10) {
-        suggestions.push(`样本量不足: 仅${completed.length}笔已完成交易，统计意义有限，建议积累至少30笔再评估策略有效性`);
-    }
-    if (winrate < 40 && completed.length >= 5) {
-        suggestions.push(`胜率偏低(${winrate.toFixed(0)}%): 入场条件可能过于宽松，考虑提高H1/L1的实体占比阈值(当前0.6)或增加额外过滤条件`);
-    }
-    if (profitFactor < 1 && completed.length >= 5) {
-        suggestions.push(`盈亏比<1(${profitFactor.toFixed(2)}): 总体亏损，需优化止损距离(ATR×1.6)或止盈倍数(当前1.5R)`);
-    }
-    if (Math.abs(longWinrate - shortWinrate) > 30 && longCompleted.length >= 3 && shortCompleted.length >= 3) {
-        const better = longWinrate > shortWinrate ? '做多' : '做空';
-        const worse = longWinrate > shortWinrate ? '做空' : '做多';
-        suggestions.push(`${better}显著优于${worse}: 多空胜率差距${Math.abs(longWinrate - shortWinrate).toFixed(0)}%，可能存在方向偏好，检查1H方向判断逻辑`);
-    }
-    if (avgBars >= 50) {
-        suggestions.push(`持仓时间偏长(${avgBars.toFixed(0)}根5min K线≈${(avgBars*5/60).toFixed(1)}小时): 信号可能入场时机偏早，等待更明确的突破确认`);
-    }
-    if (ongoing.length > 5) {
-        suggestions.push(`过多进行中信号(${ongoing.length}笔): 可能是止盈/止损距离过远，或信号频繁但趋势不明显`);
-    }
-    // 检查连续亏损
-    let maxConsecLoss = 0, curConsec = 0;
-    completed.forEach(s => {
-        if (s.result === 'loss') { curConsec++; maxConsecLoss = Math.max(maxConsecLoss, curConsec); }
-        else curConsec = 0;
-    });
-    if (maxConsecLoss >= 3) {
-        suggestions.push(`最大连续亏损${maxConsecLoss}笔: 需要风控机制应对连续亏损，建议单日最大亏损2R后停止交易`);
-    }
-    if (suggestions.length === 0 && completed.length >= 10) {
-        suggestions.push('策略表现稳定，继续保持当前规则执行');
-    }
-    
-    html += '<div class="suggestion"><span class="label">改进建议:</span><ul>';
-    suggestions.forEach(s => html += `<li>${s}</li>`);
-    html += '</ul></div>';
-    
-    // 后续完善方向
-    html += '<h4>后续完善方向</h4>';
-    html += '<ul>';
-    html += '<li><strong>方向判断优化:</strong> 当前历史回扫用全局1H方向，应改为滑动窗口方向判断，每个信号点用其前方的1H结构</li>';
-    html += '<li><strong>信号去重:</strong> 当前5根K线去重可能过于简单，应结合实际波动幅度动态调整去重间隔</li>';
-    html += '<li><strong>趋势日/震荡日区分:</strong> 历史回扫未区分趋势日/震荡日，应引入R4三条件判断每个信号当时的模式</li>';
-    html += '<li><strong>止盈优化:</strong> 当前固定1.5R止盈，可考虑动态止盈(ATR扩展或移动止损)</li>';
-    html += '<li><strong>时段过滤:</strong> 加入交易时段过滤，排除亚盘低波动时段的虚假信号</li>';
-    html += '<li><strong>信号标注:</strong> 在5min图上标注信号点的止损/目标位，可视化每笔交易的完整路径</li>';
-    html += '<li><strong>连亏反手验证:</strong> 反手机制已实现，需积累更多样本验证反手后胜率是否确实更高</li>';
-    html += '<li><strong>实盘状态同步:</strong> 当前state在Vercel只读，需用外部存储(如KV)同步连亏状态到下次扫描</li>';
-    html += '</ul>';
-    
-    el.innerHTML = html;
-    
-    // 更新统计
-    const statsEl = document.getElementById('analysisStats');
-    if (statsEl) statsEl.textContent = `${completed.length}笔完成 · ${ongoing.length}笔进行中 · 期望值${expectancy >= 0 ? '+' : ''}${expectancy.toFixed(1)}点/笔`;
-}
-
-// 加载 Lightweight Charts SDK
-function loadScript(src) {
-    return new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = src;
-        s.onload = resolve;
-        s.onerror = reject;
-        document.head.appendChild(s);
-    });
-}
-
-loadScript('https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js')
-    .then(() => {
-        loadChart();
-        renderSignalTable();
-    })
-    .catch(e => {
-        console.error('Failed to load Lightweight Charts:', e);
-        const container = document.getElementById('tradingChart');
-        if (container) container.innerHTML = '<div style="padding:20px;color:#ff5252;text-align:center">图表加载失败: ' + (e.message || e) + '<br><span style="color:#666">CDN: jsdelivr.net/lightweight-charts</span></div>';
-    });
-</script>'''
-    html = html.replace('__SCRIPT_PLACEHOLDER__', js_code)
-    return html
-
-# ---------------- Telegram ----------------
-
-def send_telegram(cfg: Dict, text: str) -> bool:
+def push_telegram(cfg: Dict, message: str) -> bool:
     token = cfg.get("telegram_bot_token", "")
     chat_id = cfg.get("telegram_chat_id", "")
-    if not token or not chat_id:
-        log("Telegram 未配置 Bot Token, 跳过推送")
+    if not token or not chat_id or not cfg.get("telegram_enabled", False):
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=payload, timeout=15)
-        if r.status_code == 200:
-            log(f"Telegram 推送成功 → chat_id={chat_id}")
-            return True
-        else:
-            log(f"Telegram 推送失败: {r.status_code} {r.text[:200]}")
-            return False
+        return r.status_code == 200
     except Exception as e:
-        log(f"Telegram 推送异常: {e}")
+        log(f"Telegram push 失败: {e}")
         return False
 
-def build_signal_message(result: Dict) -> str:
-    d = result
-    dir_text = "做多 🟢" if d["direction"] == "up" else "做空 🔴" if d["direction"] == "down" else "中性"
-    checks = d["checks"]
-    lines = [
-        f"<b>XAU/USD 交易信号触发</b>",
-        f"",
-        f"方向: {dir_text} ({d['direction']})",
-        f"模式: {d['day_mode']}",
-        f"信号: {d['signal']['signal']} - {d['signal']['detail']}",
-        f"",
-        f"📊 交易计划:",
-        f"  Entry: {d.get('entry_price','--')}",
-        f"  Stop:  {d.get('stop_price','--')} (距离 {d['stop_distance']:.2f})",
-        f"  Target: {d.get('target_price','--')} ({d['target_R']})",
-        f"",
-        f"✅ 规则检查:",
-    ]
-    for k, v in checks.items():
-        icon = "✅" if v["pass"] else "❌"
-        lines.append(f"  {icon} {v['label']}: {v['detail']}")
-    lines.append(f"")
-    lines.append(f"⏰ {d['now']}")
-    return "\n".join(lines)
-
-# ---------------- Main ----------------
+# ---------------- Main Entry ----------------
 
 def run_engine(manual_override: str = None) -> dict:
-    """供 serverless 调用：执行引擎并返回 HTML + result，不写文件
-    manual_override: None=自动, 'long'=强制做多, 'short'=强制做空, 'resume'=恢复自动交易
-    """
+    """供 serverless 调用：执行引擎并返回 HTML + result"""
     cfg = load_config()
-    # Vercel 环境变量覆盖
     if os.environ.get("TELEGRAM_BOT_TOKEN"):
         cfg["telegram_bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
     if os.environ.get("TELEGRAM_CHAT_ID"):
@@ -2173,141 +1050,64 @@ def run_engine(manual_override: str = None) -> dict:
     if os.environ.get("TELEGRAM_ENABLED"):
         cfg["telegram_enabled"] = os.environ["TELEGRAM_ENABLED"].lower() in ("true", "1", "yes")
 
-    in_window, window_msg = is_trading_window(cfg)
+    # 获取数据
+    symbol = cfg.get("symbol_yahoo", "GC=F")
+    r_1h = fetch_yahoo(symbol, "3mo", "1h")
+    bars_1h = to_bars(r_1h)
+    r_15m = fetch_yahoo(symbol, "1mo", "15m")
+    bars_15m = to_bars(r_15m)
 
-    r1h = fetch_yahoo(cfg["symbol_yahoo"], cfg["data_range_1h"], cfg["data_interval_1h"])
-    bars_1h = to_bars(r1h)
-    r5m = fetch_yahoo(cfg["symbol_yahoo"], cfg["data_range_5m"], cfg["data_interval_5m"])
-    bars_5m = to_bars(r5m)
+    current_price = bars_15m[-1]["close"] if bars_15m else (bars_1h[-1]["close"] if bars_1h else 0)
 
-    result = check_rules(cfg, bars_1h, bars_5m, manual_override=manual_override)
-    
-    # 扫描历史信号
-    atr_5m = result.get("atr_5m", 10.0)
-    sig_history = scan_signal_history(bars_5m, bars_1h, atr_5m)
-    
-    html = generate_html(result, bars_1h, bars_5m, signal_history=sig_history)
-
-    # 推送逻辑
-    should_push = False
-    push_reason = ""
-    state = result.get("state", {})
-    
-    if not in_window:
-        push_reason = "不在交易时段"
-    elif result["all_pass"]:
-        # 检查是否同一信号已推送过（防重复）
-        sig_key = f"{result['direction']}_{result['signal']['signal']}_{result['signal']['type']}"
-        recent = state.get("signals_today", [])
-        last_sig_ts = state.get("last_signal_ts")
-        now_ts = dt.datetime.now().timestamp()
-        if last_sig_ts and (now_ts - last_sig_ts) < 1800 and any(s.get("key") == sig_key for s in recent):
-            push_reason = f"30分钟内已推送过相同信号 {sig_key}, 跳过"
-        else:
-            should_push = True
-            push_reason = "全部条件满足, 推送信号"
-            state.setdefault("signals_today", []).append({"key": sig_key, "ts": now_ts, "time": result["now"]})
-            state["last_signal_ts"] = now_ts
-            # 记录交易到 trade_results
-            trade_record = {
-                "date": result["now"],
-                "direction": result["direction"],
-                "signal": result["signal"]["signal"],
-                "type": result["signal"].get("type", ""),
-                "entry_price": result.get("entry_price"),
-                "stop_price": result.get("stop_price"),
-                "target_price": result.get("target_price"),
-                "stop_distance": result.get("stop_distance", 0),
-                "day_mode": result["day_mode"],
-                "detail": result["signal"].get("detail", ""),
-                "sig_key": sig_key,
-            }
-            state.setdefault("trade_results", []).append(trade_record)
-            # 限制最多 500 条
-            if len(state["trade_results"]) > 500:
-                state["trade_results"] = state["trade_results"][-500:]
-    else:
-        push_reason = f"{sum(1 for v in result['checks'].values() if not v['pass'])} 项未满足"
-    
-    # 持久化 state (GitHub API 或本地文件)
-    save_state(state)
-    
-    if should_push:
-        try:
-            msg = build_signal_message(result)
-            send_telegram(cfg, msg)
-        except Exception as e:
-            push_reason += f" (推送异常: {e})"
-
-    return {"html": html, "result": result, "push_reason": push_reason, "in_window": in_window}
-
-
-def main():
-    cfg = load_config()
-    log("=== Gold Trading Decision Engine 开始运行 ===")
-
-    # 检查交易时段（非交易时段也生成报告，但不推送）
-    in_window, window_msg = is_trading_window(cfg)
-    log(f"时段检查: {window_msg}")
-
-    try:
-        log("获取 1h 数据...")
-        r1h = fetch_yahoo(cfg["symbol_yahoo"], cfg["data_range_1h"], cfg["data_interval_1h"])
-        bars_1h = to_bars(r1h)
-        log(f"1h bars: {len(bars_1h)}, last close={bars_1h[-1]['close']:.2f}")
-
-        log("获取 5m 数据...")
-        r5m = fetch_yahoo(cfg["symbol_yahoo"], cfg["data_range_5m"], cfg["data_interval_5m"])
-        bars_5m = to_bars(r5m)
-        log(f"5m bars: {len(bars_5m)}, last close={bars_5m[-1]['close']:.2f}")
-    except Exception as e:
-        log(f"数据获取失败: {e}")
-        return
-
-    # 规则引擎
-    result = check_rules(cfg, bars_1h, bars_5m)
-    log(f"规则引擎: all_pass={result['all_pass']}, direction={result['direction']}, mode={result['day_mode']}, signal={result['signal']['signal']}")
+    # 执行三套方法
+    m1 = method1_naked_k(bars_1h, bars_15m)
+    m2 = method2_dd_structure(bars_1h, bars_15m)
+    m3 = method3_complex_pullback(bars_1h, bars_15m)
+    results = [m1, m2, m3]
 
     # 生成 HTML
-    atr_5m_local = result.get("atr_5m", 10.0)
-    sig_history_local = scan_signal_history(bars_5m, bars_1h, atr_5m_local)
-    html = generate_html(result, bars_1h, bars_5m, signal_history=sig_history_local)
-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
-        f.write(html)
-    log(f"HTML 报告已写入: {REPORT_PATH}")
+    html = generate_html(results, bars_1h, bars_15m, current_price)
 
-    # 推送逻辑
-    state = result.get("state", {})
-    should_push = False
+    # 注入图表数据
+    candle_1h, ma1h, candle_15m = prepare_chart_data(bars_1h, bars_15m)
+    inject_script = f"""
+<script>
+window._data1h={json.dumps(candle_1h)};
+window._ma1h={json.dumps(ma1h)};
+window._data15m={json.dumps(candle_15m)};
+</script>
+"""
+    html = html + inject_script
+
+    # 检查信号并推送 Telegram
+    signals_found = []
+    for r in results:
+        if r.get("signal"):
+            signals_found.append(r["signal"])
     push_reason = ""
-
-    if not in_window:
-        push_reason = "不在交易时段, 不推送"
-    elif result["all_pass"]:
-        # 检查是否同一信号已推送过（防重复）
-        sig_key = f"{result['direction']}_{result['signal']['signal']}_{result['signal']['type']}"
-        recent = state.get("signals_today", [])
-        last_sig_ts = state.get("last_signal_ts")
-        # 同方向同信号 30 分钟内不重复推送
-        now_ts = dt.datetime.now().timestamp()
-        if last_sig_ts and (now_ts - last_sig_ts) < 1800 and any(s.get("key") == sig_key for s in recent):
-            push_reason = f"30分钟内已推送过相同信号 {sig_key}, 跳过"
-        else:
-            should_push = True
-            push_reason = "全部条件满足, 推送信号"
-            state.setdefault("signals_today", []).append({"key": sig_key, "ts": now_ts, "time": result["now"]})
-            state["last_signal_ts"] = now_ts
+    if signals_found:
+        msg_lines = [f"⚡ XAU/USD 交易信号 @ {now_sh().strftime('%H:%M')} (GMT+8)"]
+        msg_lines.append(f"当前价格: {current_price:.2f}")
+        msg_lines.append("")
+        for s in signals_found:
+            msg_lines.append(f"【{s['method']}】{s['direction']}")
+            msg_lines.append(f"  类型: {s['type']}")
+            msg_lines.append(f"  入场: {s['entry']:.2f}")
+            msg_lines.append(f"  止损: {s['stop']:.2f}")
+            msg_lines.append(f"  止盈: {s['target']:.2f}")
+            msg_lines.append(f"  详情: {s['detail']}")
+            msg_lines.append("")
+        push_telegram(cfg, "\n".join(msg_lines))
+        push_reason = f"发现 {len(signals_found)} 个信号, 已推送 Telegram"
     else:
-        push_reason = f"{sum(1 for v in result['checks'].values() if not v['pass'])} 项未满足, 不推送"
+        push_reason = "无信号"
 
-    log(f"推送决策: {push_reason}")
-
-    if should_push:
-        msg = build_signal_message(result)
-        send_telegram(cfg, msg)
-
-    save_state(state)
-    log("=== 运行结束 ===\n")
-
-if __name__ == "__main__":
-    main()
+    return {
+        "html": html,
+        "result": {
+            "price": current_price,
+            "signals": signals_found,
+        },
+        "push_reason": push_reason,
+        "in_window": True,
+    }
